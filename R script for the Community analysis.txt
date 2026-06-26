@@ -1,0 +1,678 @@
+############################################################
+## Batch Community Diversity Analysis
+##
+## This script processes paired invasive/native OTU tables
+## from multiple studies and calculates alpha diversity,
+## beta diversity, Bray-Curtis distances, and article-level
+## PERMANOVA statistics.
+##
+## Expected file names:
+##   I16S-Article1.xlsx
+##   N16S-Article1.xlsx 
+##
+## Outputs:
+##   - Sample-level alpha diversity
+##   - Sample-level beta diversity metrics
+##   - Plant-group-level summary tables
+##   - Article-level PERMANOVA and beta-diversity summaries
+##   - Bray-Curtis distance matrices
+############################################################
+
+## Required packages ----------------------------------------------------------
+
+required_pkgs <- c(
+  "readxl", "openxlsx", "vegan", "dplyr", "tibble",
+  "tidyr", "stringr", "purrr"
+)
+
+installed_pkgs <- rownames(installed.packages())
+for (pkg in required_pkgs) {
+  if (!pkg %in% installed_pkgs) {
+    install.packages(pkg, dependencies = TRUE)
+  }
+}
+
+suppressPackageStartupMessages({
+  library(readxl)
+  library(openxlsx)
+  library(vegan)
+  library(dplyr)
+  library(tibble)
+  library(tidyr)
+  library(stringr)
+  library(purrr)
+})
+
+options(stringsAsFactors = FALSE)
+
+
+## User settings --------------------------------------------------------------
+
+workdir <- "E:/桌面/Community/16S-NI"
+
+min_total_count <- 5
+min_prevalence <- 2
+perm_n <- 999
+
+output_dir_name <- "Batch_Community_ArticlePair_Results"
+
+
+## Input files ----------------------------------------------------------------
+
+if (!dir.exists(workdir)) {
+  stop("Working directory does not exist: ", workdir)
+}
+
+setwd(workdir)
+
+input_files <- list.files(
+  path = workdir,
+  pattern = "\\.xlsx$",
+  full.names = TRUE
+)
+
+input_files <- input_files[!grepl("^~\\$", basename(input_files))]
+
+if (length(input_files) == 0) {
+  stop("No .xlsx files were found in the working directory.")
+}
+
+out_dir <- file.path(workdir, output_dir_name)
+if (!dir.exists(out_dir)) {
+  dir.create(out_dir, recursive = TRUE)
+}
+
+
+## File-name parser -----------------------------------------------------------
+
+parse_file_info <- function(file_path) {
+  file_name <- tools::file_path_sans_ext(basename(file_path))
+
+  habitat_type <- case_when(
+    str_detect(file_name, "^I") ~ "Invasive",
+    str_detect(file_name, "^N") ~ "Native",
+    str_detect(file_name, "Invasive") ~ "Invasive",
+    str_detect(file_name, "Native") ~ "Native",
+    str_detect(file_name, "Invasive") ~ "Invasive",
+    str_detect(file_name, "Native") ~ "Native",
+    TRUE ~ NA_character_
+  )
+
+  article_id <- str_extract(file_name, "Article\\d+|文章\\d+")
+
+  if (!is.na(article_id)) {
+    article_num <- str_extract(article_id, "\\d+")
+    article_id <- paste0("Article", article_num)
+  }
+
+  data.frame(
+    FilePath = file_path,
+    FileName = file_name,
+    HabitatType = habitat_type,
+    ArticleID = article_id,
+    stringsAsFactors = FALSE
+  )
+}
+
+file_info <- bind_rows(lapply(input_files, parse_file_info)) %>%
+  filter(!is.na(HabitatType), !is.na(ArticleID))
+
+if (nrow(file_info) == 0) {
+  stop(
+    "No valid paired files were detected. Expected names such as ",
+    "I16S-Article1.xlsx / N16S-Article1.xlsx or ",
+    "I16S-文章1.xlsx / N16S-文章1.xlsx."
+  )
+}
+
+
+## Utility functions ----------------------------------------------------------
+
+read_otu_excel <- function(file) {
+  dat <- readxl::read_excel(file)
+  dat <- as.data.frame(dat, check.names = FALSE)
+
+  if (ncol(dat) < 2) {
+    stop("The input file has too few columns to be an OTU table: ", basename(file))
+  }
+
+  colnames(dat)[1] <- "OTU_ID"
+  dat <- dat[, colSums(!is.na(dat)) > 0, drop = FALSE]
+  dat
+}
+
+
+split_otu_and_tax <- function(dat) {
+  col_names <- colnames(dat)
+
+  tax_keywords <- c(
+    "taxonomy", "tax", "kingdom", "phylum", "class",
+    "order", "family", "genus", "species"
+  )
+
+  tax_idx <- which(tolower(col_names) %in% tax_keywords)
+  sample_candidates <- setdiff(seq_along(col_names), c(1, tax_idx))
+
+  is_numeric_sample <- sapply(dat[, sample_candidates, drop = FALSE], function(x) {
+    suppressWarnings({
+      x_num <- as.numeric(x)
+      mean(!is.na(x_num)) > 0.8
+    })
+  })
+
+  sample_idx <- sample_candidates[is_numeric_sample]
+
+  if (length(sample_idx) < 2) {
+    stop("Sample columns could not be detected: ", paste(col_names, collapse = ", "))
+  }
+
+  otu_df <- dat[, c(1, sample_idx), drop = FALSE]
+
+  for (j in 2:ncol(otu_df)) {
+    otu_df[[j]] <- suppressWarnings(as.numeric(otu_df[[j]]))
+  }
+
+  otu_df[is.na(otu_df)] <- 0
+  otu_df$OTU_ID <- make.unique(as.character(otu_df$OTU_ID))
+  otu_df
+}
+
+
+filter_otu_table <- function(otu_df, min_total_count = 5, min_prevalence = 2) {
+  otu_mat <- as.matrix(otu_df[, -1, drop = FALSE])
+  rownames(otu_mat) <- otu_df$OTU_ID
+
+  keep_total <- rowSums(otu_mat) >= min_total_count
+  keep_prev <- rowSums(otu_mat > 0) >= min_prevalence
+  keep <- keep_total & keep_prev
+
+  filtered_mat <- otu_mat[keep, , drop = FALSE]
+
+  if (nrow(filtered_mat) == 0) {
+    stop("No OTUs remained after filtering.")
+  }
+
+  filtered_mat
+}
+
+
+extract_plant_group <- function(sample_names) {
+  plant_group <- str_extract(sample_names, "^[A-Za-z]+")
+  plant_group[is.na(plant_group) | plant_group == ""] <-
+    sample_names[is.na(plant_group) | plant_group == ""]
+  plant_group
+}
+
+
+build_metadata <- function(sample_names, habitat_type, article_id, file_name) {
+  meta <- data.frame(
+    SampleID = sample_names,
+    PlantGroup = extract_plant_group(sample_names),
+    HabitatType = habitat_type,
+    ArticleID = article_id,
+    FileName = file_name,
+    stringsAsFactors = FALSE
+  )
+
+  rownames(meta) <- meta$SampleID
+  meta
+}
+
+
+calc_alpha_diversity <- function(otu_mat, meta) {
+  comm <- t(otu_mat)
+
+  alpha_df <- data.frame(
+    SampleID = rownames(comm),
+    Observed_OTUs = as.numeric(specnumber(comm)),
+    Shannon = as.numeric(diversity(comm, index = "shannon")),
+    Simpson = as.numeric(diversity(comm, index = "simpson")),
+    Chao1 = as.numeric(estimateR(comm)["S.chao1", ]),
+    stringsAsFactors = FALSE
+  ) %>%
+    left_join(meta, by = "SampleID")
+
+  alpha_df
+}
+
+
+calc_bray_curtis <- function(otu_mat) {
+  comm <- t(otu_mat)
+  bray_dist <- vegdist(comm, method = "bray")
+
+  list(
+    dist = bray_dist,
+    matrix = as.matrix(bray_dist)
+  )
+}
+
+
+calc_beta_sample_metrics <- function(bray_dist, bray_mat, meta) {
+  beta_disp <- betadisper(bray_dist, group = meta$HabitatType, type = "centroid")
+
+  centroid_df <- data.frame(
+    SampleID = names(beta_disp$distances),
+    Distance_to_centroid = as.numeric(beta_disp$distances),
+    stringsAsFactors = FALSE
+  )
+
+  sample_ids <- rownames(bray_mat)
+
+  same_plant_group_mean <- sapply(sample_ids, function(sample_id) {
+    plant_group <- meta[sample_id, "PlantGroup"]
+    same_ids <- meta$SampleID[
+      meta$PlantGroup == plant_group & meta$SampleID != sample_id
+    ]
+
+    if (length(same_ids) == 0) return(NA_real_)
+    mean(bray_mat[sample_id, same_ids], na.rm = TRUE)
+  })
+
+  same_habitat_mean <- sapply(sample_ids, function(sample_id) {
+    habitat <- meta[sample_id, "HabitatType"]
+    same_ids <- meta$SampleID[
+      meta$HabitatType == habitat & meta$SampleID != sample_id
+    ]
+
+    if (length(same_ids) == 0) return(NA_real_)
+    mean(bray_mat[sample_id, same_ids], na.rm = TRUE)
+  })
+
+  other_habitat_mean <- sapply(sample_ids, function(sample_id) {
+    habitat <- meta[sample_id, "HabitatType"]
+    other_ids <- meta$SampleID[meta$HabitatType != habitat]
+
+    if (length(other_ids) == 0) return(NA_real_)
+    mean(bray_mat[sample_id, other_ids], na.rm = TRUE)
+  })
+
+  data.frame(
+    SampleID = sample_ids,
+    MeanDist_to_same_PlantGroup = as.numeric(same_plant_group_mean),
+    MeanDist_to_same_Habitat = as.numeric(same_habitat_mean),
+    MeanDist_to_other_Habitat = as.numeric(other_habitat_mean),
+    stringsAsFactors = FALSE
+  ) %>%
+    left_join(centroid_df, by = "SampleID") %>%
+    left_join(meta, by = "SampleID")
+}
+
+
+calc_group_summary <- function(alpha_df, beta_sample_df) {
+  alpha_summary <- alpha_df %>%
+    group_by(ArticleID, HabitatType, PlantGroup) %>%
+    summarise(
+      n_samples = n(),
+      Mean_Observed_OTUs = mean(Observed_OTUs, na.rm = TRUE),
+      Mean_Shannon = mean(Shannon, na.rm = TRUE),
+      Mean_Simpson = mean(Simpson, na.rm = TRUE),
+      Mean_Chao1 = mean(Chao1, na.rm = TRUE),
+      .groups = "drop"
+    )
+
+  beta_summary <- beta_sample_df %>%
+    group_by(ArticleID, HabitatType, PlantGroup) %>%
+    summarise(
+      Mean_Distance_to_centroid = mean(Distance_to_centroid, na.rm = TRUE),
+      MeanDist_to_same_PlantGroup = mean(MeanDist_to_same_PlantGroup, na.rm = TRUE),
+      MeanDist_to_same_Habitat = mean(MeanDist_to_same_Habitat, na.rm = TRUE),
+      MeanDist_to_other_Habitat = mean(MeanDist_to_other_Habitat, na.rm = TRUE),
+      .groups = "drop"
+    )
+
+  left_join(
+    alpha_summary,
+    beta_summary,
+    by = c("ArticleID", "HabitatType", "PlantGroup")
+  )
+}
+
+
+calc_article_summary <- function(bray_dist, bray_mat, meta, article_id, perm_n = 999) {
+  if (length(unique(meta$HabitatType)) < 2) {
+    return(data.frame(
+      ArticleID = article_id,
+      PERMANOVA_F = NA_real_,
+      PERMANOVA_R2 = NA_real_,
+      PERMANOVA_P = NA_real_,
+      Invasive_mean_centroid_distance = NA_real_,
+      Native_mean_centroid_distance = NA_real_,
+      Delta_centroid_distance = NA_real_,
+      Invasive_mean_within_bray = NA_real_,
+      Native_mean_within_bray = NA_real_,
+      Delta_within_bray = NA_real_,
+      Mean_between_habitat_bray = NA_real_,
+      Note = "Only one habitat type; article-level comparison skipped.",
+      stringsAsFactors = FALSE
+    ))
+  }
+
+  adonis_res <- adonis2(bray_dist ~ HabitatType, data = meta, permutations = perm_n)
+  adonis_df <- as.data.frame(adonis_res)
+  adonis_df$Term <- rownames(adonis_df)
+  rownames(adonis_df) <- NULL
+  adonis_main <- adonis_df[adonis_df$Term == "HabitatType", , drop = FALSE]
+
+  beta_disp <- betadisper(bray_dist, group = meta$HabitatType, type = "centroid")
+
+  centroid_df <- data.frame(
+    SampleID = names(beta_disp$distances),
+    Distance_to_centroid = as.numeric(beta_disp$distances),
+    stringsAsFactors = FALSE
+  ) %>%
+    left_join(meta, by = "SampleID")
+
+  inv_centroid <- mean(
+    centroid_df$Distance_to_centroid[centroid_df$HabitatType == "Invasive"],
+    na.rm = TRUE
+  )
+
+  nat_centroid <- mean(
+    centroid_df$Distance_to_centroid[centroid_df$HabitatType == "Native"],
+    na.rm = TRUE
+  )
+
+  inv_ids <- meta$SampleID[meta$HabitatType == "Invasive"]
+  nat_ids <- meta$SampleID[meta$HabitatType == "Native"]
+
+  get_within_mean <- function(sample_ids, dist_mat) {
+    if (length(sample_ids) < 2) return(NA_real_)
+    sub_mat <- dist_mat[sample_ids, sample_ids, drop = FALSE]
+    mean(sub_mat[upper.tri(sub_mat)], na.rm = TRUE)
+  }
+
+  inv_within <- get_within_mean(inv_ids, bray_mat)
+  nat_within <- get_within_mean(nat_ids, bray_mat)
+
+  between_mean <- if (length(inv_ids) > 0 && length(nat_ids) > 0) {
+    mean(bray_mat[inv_ids, nat_ids], na.rm = TRUE)
+  } else {
+    NA_real_
+  }
+
+  p_col <- grep("Pr", colnames(adonis_main), value = TRUE)[1]
+
+  data.frame(
+    ArticleID = article_id,
+    PERMANOVA_F = adonis_main$F[1],
+    PERMANOVA_R2 = adonis_main$R2[1],
+    PERMANOVA_P = adonis_main[[p_col]][1],
+    Invasive_mean_centroid_distance = inv_centroid,
+    Native_mean_centroid_distance = nat_centroid,
+    Delta_centroid_distance = inv_centroid - nat_centroid,
+    Invasive_mean_within_bray = inv_within,
+    Native_mean_within_bray = nat_within,
+    Delta_within_bray = inv_within - nat_within,
+    Mean_between_habitat_bray = between_mean,
+    Note = NA_character_,
+    stringsAsFactors = FALSE
+  )
+}
+
+
+save_distance_matrix <- function(bray_mat, out_file) {
+  wb <- createWorkbook()
+  addWorksheet(wb, "BrayCurtis")
+  writeData(
+    wb,
+    "BrayCurtis",
+    data.frame(SampleID = rownames(bray_mat), bray_mat),
+    rowNames = FALSE
+  )
+  saveWorkbook(wb, out_file, overwrite = TRUE)
+}
+
+
+merge_paired_otu_tables <- function(invasive_file, native_file) {
+  invasive_raw <- read_otu_excel(invasive_file$FilePath)
+  native_raw <- read_otu_excel(native_file$FilePath)
+
+  invasive_otu <- split_otu_and_tax(invasive_raw)
+  native_otu <- split_otu_and_tax(native_raw)
+
+  invasive_df <- as.data.frame(invasive_otu, check.names = FALSE)
+  native_df <- as.data.frame(native_otu, check.names = FALSE)
+
+  merged_df <- full_join(invasive_df, native_df, by = "OTU_ID")
+  merged_df[is.na(merged_df)] <- 0
+
+  otu_mat <- filter_otu_table(
+    merged_df,
+    min_total_count = min_total_count,
+    min_prevalence = min_prevalence
+  )
+
+  invasive_meta <- build_metadata(
+    sample_names = colnames(invasive_df)[-1],
+    habitat_type = "Invasive",
+    article_id = invasive_file$ArticleID[1],
+    file_name = invasive_file$FileName[1]
+  )
+
+  native_meta <- build_metadata(
+    sample_names = colnames(native_df)[-1],
+    habitat_type = "Native",
+    article_id = native_file$ArticleID[1],
+    file_name = native_file$FileName[1]
+  )
+
+  meta <- bind_rows(invasive_meta, native_meta)
+  meta <- meta[colnames(otu_mat), , drop = FALSE]
+
+  list(
+    otu_mat = otu_mat,
+    meta = meta
+  )
+}
+
+
+## Process paired datasets ----------------------------------------------------
+
+article_ids <- sort(unique(file_info$ArticleID))
+
+all_alpha <- list()
+all_beta_sample <- list()
+all_group_summary <- list()
+all_article_summary <- list()
+all_metadata <- list()
+
+for (article_id in article_ids) {
+  message("Processing ", article_id, " ...")
+
+  article_dir <- file.path(out_dir, article_id)
+  if (!dir.exists(article_dir)) {
+    dir.create(article_dir, recursive = TRUE)
+  }
+
+  article_files <- file_info %>% filter(ArticleID == article_id)
+  invasive_file <- article_files %>% filter(HabitatType == "Invasive")
+  native_file <- article_files %>% filter(HabitatType == "Native")
+
+  if (nrow(invasive_file) == 0 || nrow(native_file) == 0) {
+    warning(article_id, " was skipped because the invasive or native file is missing.")
+    next
+  }
+
+  result <- tryCatch({
+    merged <- merge_paired_otu_tables(invasive_file, native_file)
+    otu_mat <- merged$otu_mat
+    meta <- merged$meta
+
+    alpha_df <- calc_alpha_diversity(otu_mat, meta)
+
+    bray_res <- calc_bray_curtis(otu_mat)
+    bray_dist <- bray_res$dist
+    bray_mat <- bray_res$matrix
+
+    beta_sample_df <- calc_beta_sample_metrics(bray_dist, bray_mat, meta)
+    group_summary_df <- calc_group_summary(alpha_df, beta_sample_df)
+    article_summary_df <- calc_article_summary(
+      bray_dist,
+      bray_mat,
+      meta,
+      article_id,
+      perm_n = perm_n
+    )
+
+    write.xlsx(
+      alpha_df,
+      file = file.path(article_dir, paste0(article_id, "_alpha_diversity.xlsx")),
+      rowNames = FALSE
+    )
+
+    write.xlsx(
+      beta_sample_df,
+      file = file.path(article_dir, paste0(article_id, "_beta_diversity.xlsx")),
+      rowNames = FALSE
+    )
+
+    write.xlsx(
+      group_summary_df,
+      file = file.path(article_dir, paste0(article_id, "_plant_group_summary.xlsx")),
+      rowNames = FALSE
+    )
+
+    write.xlsx(
+      article_summary_df,
+      file = file.path(article_dir, paste0(article_id, "_permanova_summary.xlsx")),
+      rowNames = FALSE
+    )
+
+    write.xlsx(
+      meta,
+      file = file.path(article_dir, paste0(article_id, "_metadata.xlsx")),
+      rowNames = FALSE
+    )
+
+    save_distance_matrix(
+      bray_mat,
+      out_file = file.path(article_dir, paste0(article_id, "_bray_curtis_matrix.xlsx"))
+    )
+
+    list(
+      alpha = alpha_df,
+      beta_sample = beta_sample_df,
+      group_summary = group_summary_df,
+      article_summary = article_summary_df,
+      metadata = meta
+    )
+  }, error = function(e) {
+    message("ERROR in ", article_id, ": ", e$message)
+
+    list(
+      alpha = data.frame(
+        ArticleID = article_id,
+        SampleID = NA_character_,
+        Observed_OTUs = NA_real_,
+        Shannon = NA_real_,
+        Simpson = NA_real_,
+        Chao1 = NA_real_,
+        PlantGroup = NA_character_,
+        HabitatType = NA_character_,
+        FileName = NA_character_,
+        Note = paste("ERROR:", e$message),
+        stringsAsFactors = FALSE
+      ),
+      beta_sample = data.frame(
+        ArticleID = article_id,
+        SampleID = NA_character_,
+        Distance_to_centroid = NA_real_,
+        MeanDist_to_same_PlantGroup = NA_real_,
+        MeanDist_to_same_Habitat = NA_real_,
+        MeanDist_to_other_Habitat = NA_real_,
+        PlantGroup = NA_character_,
+        HabitatType = NA_character_,
+        Note = paste("ERROR:", e$message),
+        stringsAsFactors = FALSE
+      ),
+      group_summary = data.frame(
+        ArticleID = article_id,
+        PlantGroup = NA_character_,
+        HabitatType = NA_character_,
+        Note = paste("ERROR:", e$message),
+        stringsAsFactors = FALSE
+      ),
+      article_summary = data.frame(
+        ArticleID = article_id,
+        PERMANOVA_F = NA_real_,
+        PERMANOVA_R2 = NA_real_,
+        PERMANOVA_P = NA_real_,
+        Invasive_mean_centroid_distance = NA_real_,
+        Native_mean_centroid_distance = NA_real_,
+        Delta_centroid_distance = NA_real_,
+        Invasive_mean_within_bray = NA_real_,
+        Native_mean_within_bray = NA_real_,
+        Delta_within_bray = NA_real_,
+        Mean_between_habitat_bray = NA_real_,
+        Note = paste("ERROR:", e$message),
+        stringsAsFactors = FALSE
+      ),
+      metadata = data.frame(
+        ArticleID = article_id,
+        SampleID = NA_character_,
+        PlantGroup = NA_character_,
+        HabitatType = NA_character_,
+        Note = paste("ERROR:", e$message),
+        stringsAsFactors = FALSE
+      )
+    )
+  })
+
+  all_alpha[[length(all_alpha) + 1]] <- result$alpha
+  all_beta_sample[[length(all_beta_sample) + 1]] <- result$beta_sample
+  all_group_summary[[length(all_group_summary) + 1]] <- result$group_summary
+  all_article_summary[[length(all_article_summary) + 1]] <- result$article_summary
+  all_metadata[[length(all_metadata) + 1]] <- result$metadata
+}
+
+
+## Combine and export results -------------------------------------------------
+
+alpha_all_df <- bind_rows(all_alpha)
+beta_sample_all_df <- bind_rows(all_beta_sample)
+group_summary_all_df <- bind_rows(all_group_summary)
+article_summary_all_df <- bind_rows(all_article_summary)
+metadata_all_df <- bind_rows(all_metadata)
+
+summary_file <- file.path(out_dir, "community_analysis_summary.xlsx")
+
+wb <- createWorkbook()
+
+addWorksheet(wb, "Alpha_sample_all")
+writeData(wb, "Alpha_sample_all", alpha_all_df)
+
+addWorksheet(wb, "Beta_sample_all")
+writeData(wb, "Beta_sample_all", beta_sample_all_df)
+
+addWorksheet(wb, "PlantGroup_summary_all")
+writeData(wb, "PlantGroup_summary_all", group_summary_all_df)
+
+addWorksheet(wb, "Article_summary_all")
+writeData(wb, "Article_summary_all", article_summary_all_df)
+
+addWorksheet(wb, "Metadata_all")
+writeData(wb, "Metadata_all", metadata_all_df)
+
+saveWorkbook(wb, summary_file, overwrite = TRUE)
+
+run_summary <- data.frame(
+  Total_input_files = length(input_files),
+  Total_valid_articles = length(article_ids),
+  Total_alpha_rows = nrow(alpha_all_df),
+  Total_beta_sample_rows = nrow(beta_sample_all_df),
+  Total_group_summary_rows = nrow(group_summary_all_df),
+  Total_article_summary_rows = nrow(article_summary_all_df),
+  stringsAsFactors = FALSE
+)
+
+write.xlsx(
+  run_summary,
+  file = file.path(out_dir, "run_summary.xlsx"),
+  rowNames = FALSE
+)
+
+cat("\n====================================\n")
+cat("Analysis completed successfully.\n")
+cat("Output directory:\n", out_dir, "\n")
+cat("Summary file:\n", summary_file, "\n")
+cat("====================================\n")

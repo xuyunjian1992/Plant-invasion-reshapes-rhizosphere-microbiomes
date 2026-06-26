@@ -1,0 +1,1199 @@
+############################################################
+## ITS FUNGuild Functional Analysis
+## Guild and trophic-mode beta diversity, dispersion,
+## effect sizes, composition, and consistency
+############################################################
+
+
+## 0. Install and load packages
+
+packages <- c(
+  "readxl",
+  "openxlsx",
+  "dplyr",
+  "tidyr",
+  "stringr",
+  "tibble",
+  "purrr",
+  "ggplot2",
+  "vegan",
+  "forcats",
+  "scales"
+)
+
+installed <- rownames(installed.packages())
+
+for (pkg in packages) {
+  if (!pkg %in% installed) {
+    install.packages(pkg, dependencies = TRUE)
+  }
+  library(pkg, character.only = TRUE)
+}
+
+
+## 1. File paths and settings
+
+base_dir <- "D:/OneDrive/Desktop/ITS"
+
+invasive_input_dir <- file.path(
+  base_dir,
+  "ITS-I/IITSI-funguild_count"
+)
+
+native_input_dir <- file.path(
+  base_dir,
+  "ITS-N/NITSI-funguild_count"
+)
+
+out_dir <- file.path(
+  base_dir,
+  "ITS_FUNGuild_selected_analysis"
+)
+
+fig_dir <- file.path(out_dir, "Figures")
+table_dir <- file.path(out_dir, "Tables")
+log_dir <- file.path(out_dir, "Logs")
+
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(fig_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(table_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(log_dir, recursive = TRUE, showWarnings = FALSE)
+
+guild_mode_filename <- "guilds-mode.xlsx"
+
+top_guild_n <- 30
+pseudo_count <- 1e-6
+
+invalid_labels <- c(
+  "", "-", "0", "NA", "na", "Na", "N/A", "n/a",
+  "unassigned", "Unassigned", "Unassigned_Trophic_Mode"
+)
+
+theme_set(theme_bw(base_size = 12))
+
+
+## 1.1 Validate input paths
+
+message("Invasive input directory: ", invasive_input_dir)
+message("Native input directory: ", native_input_dir)
+
+if (!dir.exists(invasive_input_dir)) {
+  stop("Invasive input directory not found: ", invasive_input_dir)
+}
+
+if (!dir.exists(native_input_dir)) {
+  stop("Native input directory not found: ", native_input_dir)
+}
+
+if (!file.exists(file.path(invasive_input_dir, guild_mode_filename))) {
+  stop("guilds-mode.xlsx was not found in the invasive input directory: ", file.path(invasive_input_dir, guild_mode_filename))
+}
+
+## Use the invasive mapping file when the native mapping file is absent
+if (!file.exists(file.path(native_input_dir, guild_mode_filename))) {
+  warning(
+    "guilds-mode.xlsx was not found in the native input directory; using the invasive mapping file: ",
+    file.path(invasive_input_dir, guild_mode_filename)
+  )
+}
+
+
+## 2. Colors
+
+plant_cols <- c(
+  "Native" = "#8FAADC",
+  "Invasive" = "#DFA878"
+)
+
+direction_cols <- c(
+  "Invasive higher" = "#DFA878",
+  "Native higher" = "#8FAADC",
+  "No clear direction" = "grey70"
+)
+
+make_trophic_colors <- function(x) {
+  x <- sort(unique(as.character(x)))
+  cols <- grDevices::hcl.colors(length(x), palette = "Set 3")
+  names(cols) <- x
+  cols
+}
+
+
+## 3. Utility functions
+
+clean_label <- function(x) {
+  x <- as.character(x)
+  x <- trimws(x)
+  x[is.na(x)] <- ""
+  x
+}
+
+is_invalid_label <- function(x) {
+  clean_label(x) %in% invalid_labels
+}
+
+is_numeric_like <- function(x) {
+  x2 <- suppressWarnings(as.numeric(as.character(x)))
+  mean(!is.na(x2)) > 0.8
+}
+
+clean_numeric <- function(x) {
+  x <- suppressWarnings(as.numeric(x))
+  x[is.nan(x) | is.infinite(x)] <- NA_real_
+  x
+}
+
+extract_article <- function(filename) {
+  article <- stringr::str_extract(basename(filename), "\u6587\u7ae0[0-9]+")
+  ifelse(is.na(article), tools::file_path_sans_ext(basename(filename)), article)
+}
+
+read_xlsx_safe <- function(file, sheet = 1) {
+  if (!file.exists(file)) {
+    message("File not found: ", file)
+    return(NULL)
+  }
+  
+  x <- tryCatch(
+    readxl::read_excel(file, sheet = sheet, guess_max = 100000),
+    error = function(e) {
+      message("Failed to read file: ", file)
+      message("Reason: ", e$message)
+      NULL
+    }
+  )
+  
+  x
+}
+
+save_plot_both <- function(plot, filename, width = 8, height = 6) {
+  ggsave(
+    file.path(fig_dir, paste0(filename, ".pdf")),
+    plot = plot,
+    width = width,
+    height = height
+  )
+  
+  ggsave(
+    file.path(fig_dir, paste0(filename, ".png")),
+    plot = plot,
+    width = width,
+    height = height,
+    dpi = 300
+  )
+}
+
+hedges_g <- function(x1, x2) {
+  x1 <- x1[!is.na(x1)]
+  x2 <- x2[!is.na(x2)]
+  
+  n1 <- length(x1)
+  n2 <- length(x2)
+  
+  if (n1 < 2 || n2 < 2) return(NA_real_)
+  
+  m1 <- mean(x1)
+  m2 <- mean(x2)
+  s1 <- sd(x1)
+  s2 <- sd(x2)
+  
+  sp <- sqrt(((n1 - 1) * s1^2 + (n2 - 1) * s2^2) / (n1 + n2 - 2))
+  
+  if (is.na(sp) || sp == 0) return(NA_real_)
+  
+  d <- (m1 - m2) / sp
+  J <- 1 - 3 / (4 * (n1 + n2) - 9)
+  
+  d * J
+}
+
+wilcox_p_safe <- function(x1, x2) {
+  x1 <- x1[!is.na(x1)]
+  x2 <- x2[!is.na(x2)]
+  
+  if (length(x1) < 2 || length(x2) < 2) return(NA_real_)
+  
+  tryCatch(
+    wilcox.test(x1, x2)$p.value,
+    error = function(e) NA_real_
+  )
+}
+
+
+## 4. Read the Guild-to-trophic-mode mapping
+
+read_guild_mode_mapping <- function(input_dir) {
+  
+  file <- file.path(input_dir, guild_mode_filename)
+  
+  if (!file.exists(file)) {
+    file <- file.path(invasive_input_dir, guild_mode_filename)
+  }
+  
+  map_df <- read_xlsx_safe(file)
+  
+  if (is.null(map_df)) {
+    stop("guilds-mode.xlsx was not found or could not be read: ", file)
+  }
+  
+  map_df <- as.data.frame(map_df, check.names = FALSE)
+  colnames(map_df) <- trimws(colnames(map_df))
+  
+  guild_col <- grep("^Guild$", colnames(map_df), ignore.case = TRUE, value = TRUE)
+  trophic_col <- grep("^Trophic\\s*Mode$", colnames(map_df), ignore.case = TRUE, value = TRUE)
+  
+  if (length(guild_col) == 0 || length(trophic_col) == 0) {
+    stop(
+      "Guild and Trophic Mode columns were not detected in guilds-mode.xlsx. Available columns: ",
+      paste(colnames(map_df), collapse = ", ")
+    )
+  }
+  
+  map_df <- map_df[, c(guild_col[1], trophic_col[1]), drop = FALSE]
+  colnames(map_df) <- c("Guild", "TrophicMode")
+  
+  map_df <- map_df %>%
+    mutate(
+      Guild = clean_label(Guild),
+      TrophicMode = clean_label(TrophicMode)
+    ) %>%
+    filter(
+      !is_invalid_label(Guild),
+      !is_invalid_label(TrophicMode)
+    )
+  
+  ## Retain the first trophic mode for duplicated Guild entries
+  map_df <- map_df %>%
+    group_by(Guild) %>%
+    summarise(
+      TrophicMode = dplyr::first(TrophicMode),
+      .groups = "drop"
+    )
+  
+  message("Guild-to-trophic-mode mapping loaded: ", file)
+  message("Mapped Guilds: ", nrow(map_df))
+  
+  map_df
+}
+
+
+## 5. Read FUNGuild count tables
+
+read_funguild_count_table <- function(file) {
+  
+  raw <- read_xlsx_safe(file)
+  
+  if (is.null(raw)) return(NULL)
+  
+  raw <- as.data.frame(raw, check.names = FALSE)
+  
+  if (ncol(raw) < 2) {
+    message("Skipped file with fewer than two columns: ", basename(file))
+    return(NULL)
+  }
+  
+  colnames(raw) <- trimws(colnames(raw))
+  
+  guild_candidates <- which(
+    colnames(raw) %in% c("Guild", "guild", "guild_name", "Guild Name")
+  )
+  
+  if (length(guild_candidates) >= 1) {
+    guild_col_index <- guild_candidates[1]
+  } else {
+    numeric_like <- sapply(raw, is_numeric_like)
+    non_numeric_index <- which(!numeric_like)
+    
+    if (length(non_numeric_index) == 0) {
+      guild_col_index <- 1
+    } else {
+      guild_col_index <- non_numeric_index[1]
+    }
+  }
+  
+  sample_col_index <- setdiff(seq_len(ncol(raw)), guild_col_index)
+  
+  guild_vec <- clean_label(raw[[guild_col_index]])
+  
+  sample_df <- raw[, sample_col_index, drop = FALSE]
+  
+  sample_df <- data.frame(
+    lapply(sample_df, function(x) suppressWarnings(as.numeric(as.character(x)))),
+    check.names = FALSE
+  )
+  
+  sample_df[is.na(sample_df)] <- 0
+  
+  out_df <- data.frame(
+    Guild = guild_vec,
+    sample_df,
+    check.names = FALSE
+  ) %>%
+    filter(!is_invalid_label(Guild)) %>%
+    group_by(Guild) %>%
+    summarise(
+      across(everything(), ~ sum(.x, na.rm = TRUE)),
+      .groups = "drop"
+    )
+  
+  sample_cols <- setdiff(colnames(out_df), "Guild")
+  
+  out_df <- out_df %>%
+    filter(rowSums(across(all_of(sample_cols)), na.rm = TRUE) > 0)
+  
+  out_df
+}
+
+
+## 6. Read all files for one plant type
+
+read_one_plant_type <- function(input_dir, plant_type) {
+  
+  guild_mode_map <- read_guild_mode_mapping(input_dir)
+  
+  input_files <- list.files(
+    input_dir,
+    pattern = "\\.xlsx$",
+    full.names = TRUE
+  )
+  
+  input_files <- input_files[
+    !grepl("guilds-mode\\.xlsx$", basename(input_files), ignore.case = TRUE)
+  ]
+  
+  input_files <- input_files[
+    !grepl("sample_metadata\\.xlsx$", basename(input_files), ignore.case = TRUE)
+  ]
+  
+  if (length(input_files) == 0) {
+    stop("No FUNGuild count files were found in: ", input_dir)
+  }
+  
+  message("Number of ", plant_type, " files: ", length(input_files))
+  print(basename(input_files))
+  
+  all_guild_long <- list()
+  all_trophic_long <- list()
+  log_list <- list()
+  
+  for (file in input_files) {
+    
+    article <- extract_article(file)
+    
+    message("[", plant_type, "] Processing: ", basename(file))
+    
+    guild_count_df <- read_funguild_count_table(file)
+    
+    if (is.null(guild_count_df) || nrow(guild_count_df) == 0) {
+      log_list[[paste(plant_type, article, sep = "_")]] <- data.frame(
+        PlantType = plant_type,
+        Article = article,
+        File = basename(file),
+        Status = "ERROR",
+        Note = "No valid Guild entries"
+      )
+      next
+    }
+    
+    sample_cols <- setdiff(colnames(guild_count_df), "Guild")
+    
+    guild_long <- guild_count_df %>%
+      pivot_longer(
+        cols = all_of(sample_cols),
+        names_to = "SampleID",
+        values_to = "Abundance"
+      ) %>%
+      mutate(
+        PlantType = plant_type,
+        Article = article,
+        SampleID = as.character(SampleID),
+        Guild = clean_label(Guild),
+        Abundance = clean_numeric(Abundance),
+        Abundance = ifelse(is.na(Abundance), 0, Abundance)
+      )
+    
+    trophic_long <- guild_long %>%
+      left_join(guild_mode_map, by = "Guild") %>%
+      mutate(
+        TrophicMode = clean_label(TrophicMode),
+        TrophicMode = ifelse(
+          is.na(TrophicMode) | TrophicMode == "",
+          "Unassigned_Trophic_Mode",
+          TrophicMode
+        )
+      ) %>%
+      filter(
+        !is_invalid_label(TrophicMode),
+        TrophicMode != "Unassigned_Trophic_Mode"
+      ) %>%
+      group_by(PlantType, Article, SampleID, TrophicMode) %>%
+      summarise(
+        Abundance = sum(Abundance, na.rm = TRUE),
+        .groups = "drop"
+      )
+    
+    all_guild_long[[paste(plant_type, article, sep = "_")]] <- guild_long
+    all_trophic_long[[paste(plant_type, article, sep = "_")]] <- trophic_long
+    
+    log_list[[paste(plant_type, article, sep = "_")]] <- data.frame(
+      PlantType = plant_type,
+      Article = article,
+      File = basename(file),
+      Status = "OK",
+      Note = paste0(
+        "Guild number = ",
+        nrow(guild_count_df),
+        "; TrophicMode number = ",
+        dplyr::n_distinct(trophic_long$TrophicMode)
+      )
+    )
+  }
+  
+  list(
+    guild_long = bind_rows(all_guild_long),
+    trophic_long = bind_rows(all_trophic_long),
+    log = bind_rows(log_list)
+  )
+}
+
+
+## 7. Read invasive and native datasets
+
+invasive_res <- read_one_plant_type(
+  input_dir = invasive_input_dir,
+  plant_type = "Invasive"
+)
+
+native_res <- read_one_plant_type(
+  input_dir = native_input_dir,
+  plant_type = "Native"
+)
+
+guild_long_all <- bind_rows(
+  native_res$guild_long,
+  invasive_res$guild_long
+) %>%
+  mutate(
+    PlantType = factor(PlantType, levels = c("Native", "Invasive")),
+    Article = as.character(Article),
+    SampleID = as.character(SampleID),
+    RowID = paste(PlantType, Article, SampleID, sep = "|||")
+  )
+
+trophic_long_all <- bind_rows(
+  native_res$trophic_long,
+  invasive_res$trophic_long
+) %>%
+  mutate(
+    PlantType = factor(PlantType, levels = c("Native", "Invasive")),
+    Article = as.character(Article),
+    SampleID = as.character(SampleID),
+    RowID = paste(PlantType, Article, SampleID, sep = "|||")
+  )
+
+processing_log <- bind_rows(
+  native_res$log,
+  invasive_res$log
+)
+
+openxlsx::write.xlsx(
+  processing_log,
+  file.path(log_dir, "processing_log_selected_analysis.xlsx"),
+  overwrite = TRUE
+)
+
+
+## 8. Calculate relative abundance
+
+guild_rel <- guild_long_all %>%
+  group_by(PlantType, Article, SampleID, RowID) %>%
+  mutate(
+    TotalAbundance = sum(Abundance, na.rm = TRUE),
+    RelativeAbundance = ifelse(TotalAbundance > 0, Abundance / TotalAbundance, NA_real_)
+  ) %>%
+  ungroup()
+
+trophic_rel <- trophic_long_all %>%
+  group_by(PlantType, Article, SampleID, RowID) %>%
+  mutate(
+    TotalAbundance = sum(Abundance, na.rm = TRUE),
+    RelativeAbundance = ifelse(TotalAbundance > 0, Abundance / TotalAbundance, NA_real_)
+  ) %>%
+  ungroup()
+
+guild_rel$RelativeAbundance[is.na(guild_rel$RelativeAbundance)] <- 0
+trophic_rel$RelativeAbundance[is.na(trophic_rel$RelativeAbundance)] <- 0
+
+
+## 9. Build sample-by-feature matrices
+
+make_feature_matrix <- function(rel_df, feature_col) {
+  
+  mat_df <- rel_df %>%
+    select(RowID, all_of(feature_col), RelativeAbundance) %>%
+    group_by(RowID, .data[[feature_col]]) %>%
+    summarise(
+      RelativeAbundance = sum(RelativeAbundance, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    pivot_wider(
+      names_from = all_of(feature_col),
+      values_from = RelativeAbundance,
+      values_fill = 0
+    ) %>%
+    as.data.frame()
+  
+  row_ids <- mat_df$RowID
+  mat_df$RowID <- NULL
+  
+  mat <- as.matrix(mat_df)
+  rownames(mat) <- row_ids
+  
+  mat <- apply(mat, 2, function(x) suppressWarnings(as.numeric(x)))
+  mat <- as.matrix(mat)
+  rownames(mat) <- row_ids
+  
+  mat[is.na(mat)] <- 0
+  mat[is.nan(mat)] <- 0
+  mat[is.infinite(mat)] <- 0
+  
+  keep_rows <- rowSums(mat, na.rm = TRUE) > 0
+  keep_cols <- colSums(mat, na.rm = TRUE) > 0
+  
+  mat <- mat[keep_rows, keep_cols, drop = FALSE]
+  
+  meta <- tibble(RowID = rownames(mat)) %>%
+    tidyr::separate(
+      RowID,
+      into = c("PlantType", "Article", "SampleID"),
+      sep = "\\|\\|\\|",
+      remove = FALSE
+    ) %>%
+    mutate(
+      PlantType = factor(PlantType, levels = c("Native", "Invasive"))
+    )
+  
+  list(mat = mat, meta = meta)
+}
+
+guild_matrix <- make_feature_matrix(guild_rel, "Guild")
+trophic_matrix <- make_feature_matrix(trophic_rel, "TrophicMode")
+
+
+## 10. Guild and trophic-mode beta diversity
+
+calc_beta_pairs <- function(mat, meta, analysis_name) {
+  
+  out_list <- list()
+  
+  for (pt in c("Native", "Invasive")) {
+    
+    ids <- meta %>%
+      filter(PlantType == pt) %>%
+      pull(RowID)
+    
+    ids <- intersect(ids, rownames(mat))
+    
+    if (length(ids) < 2) next
+    
+    mat_sub <- mat[ids, , drop = FALSE]
+    
+    keep_rows <- rowSums(mat_sub) > 0
+    keep_cols <- colSums(mat_sub) > 0
+    
+    mat_sub <- mat_sub[keep_rows, keep_cols, drop = FALSE]
+    
+    if (nrow(mat_sub) < 2 || ncol(mat_sub) < 1) next
+    
+    dist_obj <- vegan::vegdist(mat_sub, method = "bray")
+    dist_mat <- as.matrix(dist_obj)
+    
+    cmb <- t(combn(rownames(dist_mat), 2))
+    
+    out <- data.frame(
+      Analysis = analysis_name,
+      PlantType = pt,
+      Sample1 = cmb[, 1],
+      Sample2 = cmb[, 2],
+      Distance = apply(cmb, 1, function(z) dist_mat[z[1], z[2]]),
+      stringsAsFactors = FALSE
+    ) %>%
+      left_join(
+        meta %>% select(RowID, Article, SampleID),
+        by = c("Sample1" = "RowID")
+      ) %>%
+      rename(
+        Article1 = Article,
+        SampleID1 = SampleID
+      ) %>%
+      left_join(
+        meta %>% select(RowID, Article, SampleID),
+        by = c("Sample2" = "RowID")
+      ) %>%
+      rename(
+        Article2 = Article,
+        SampleID2 = SampleID
+      )
+    
+    out_list[[pt]] <- out
+  }
+  
+  bind_rows(out_list)
+}
+
+beta_guild <- calc_beta_pairs(
+  mat = guild_matrix$mat,
+  meta = guild_matrix$meta,
+  analysis_name = "Guild"
+)
+
+beta_trophic <- calc_beta_pairs(
+  mat = trophic_matrix$mat,
+  meta = trophic_matrix$meta,
+  analysis_name = "Trophic Mode"
+)
+
+beta_all <- bind_rows(beta_guild, beta_trophic) %>%
+  mutate(
+    PlantType = factor(PlantType, levels = c("Native", "Invasive")),
+    Distance = clean_numeric(Distance)
+  )
+
+beta_summary <- beta_all %>%
+  group_by(Analysis, PlantType) %>%
+  summarise(
+    Mean = mean(Distance, na.rm = TRUE),
+    Median = median(Distance, na.rm = TRUE),
+    SD = sd(Distance, na.rm = TRUE),
+    N_pair = sum(!is.na(Distance)),
+    .groups = "drop"
+  )
+
+openxlsx::write.xlsx(
+  list(
+    "Beta_distance_pairs" = beta_all,
+    "Beta_distance_summary" = beta_summary
+  ),
+  file.path(table_dir, "01_Beta_distance_Guild_TrophicMode.xlsx"),
+  overwrite = TRUE
+)
+
+p_beta <- ggplot(
+  beta_all,
+  aes(x = PlantType, y = Distance, fill = PlantType)
+) +
+  geom_boxplot(outlier.shape = NA, width = 0.55) +
+  geom_jitter(width = 0.15, size = 0.8, alpha = 0.25) +
+  facet_wrap(~ Analysis, scales = "free_y") +
+  scale_fill_manual(values = plant_cols) +
+  labs(
+    x = NULL,
+    y = "Bray-Curtis distance",
+    title = "Fungal functional beta diversity"
+  ) +
+  theme(
+    panel.grid = element_blank(),
+    legend.position = "none"
+  )
+
+save_plot_both(
+  p_beta,
+  "Fig_01_Beta_distance_Guild_TrophicMode",
+  width = 8,
+  height = 5
+)
+
+
+## 11. Guild and trophic-mode multivariate dispersion
+
+calc_dispersion <- function(mat, meta, analysis_name) {
+  
+  if (
+    nrow(mat) < 3 ||
+    ncol(mat) < 2 ||
+    length(unique(meta$PlantType)) < 2
+  ) {
+    return(NULL)
+  }
+  
+  dist_obj <- vegan::vegdist(mat, method = "bray")
+  
+  bd <- vegan::betadisper(
+    dist_obj,
+    group = meta$PlantType
+  )
+  
+  dispersion_df <- data.frame(
+    RowID = names(bd$distances),
+    DistanceToCentroid = as.numeric(bd$distances),
+    Analysis = analysis_name,
+    stringsAsFactors = FALSE
+  ) %>%
+    left_join(meta, by = "RowID")
+  
+  dispersion_anova <- as.data.frame(anova(bd)) %>%
+    rownames_to_column("Term") %>%
+    mutate(Analysis = analysis_name)
+  
+  list(
+    dispersion = dispersion_df,
+    anova = dispersion_anova
+  )
+}
+
+disp_guild <- calc_dispersion(
+  mat = guild_matrix$mat,
+  meta = guild_matrix$meta,
+  analysis_name = "Guild"
+)
+
+disp_trophic <- calc_dispersion(
+  mat = trophic_matrix$mat,
+  meta = trophic_matrix$meta,
+  analysis_name = "Trophic Mode"
+)
+
+dispersion_all <- bind_rows(
+  if (!is.null(disp_guild)) disp_guild$dispersion else NULL,
+  if (!is.null(disp_trophic)) disp_trophic$dispersion else NULL
+) %>%
+  mutate(
+    PlantType = factor(PlantType, levels = c("Native", "Invasive"))
+  )
+
+dispersion_anova_all <- bind_rows(
+  if (!is.null(disp_guild)) disp_guild$anova else NULL,
+  if (!is.null(disp_trophic)) disp_trophic$anova else NULL
+)
+
+dispersion_summary <- dispersion_all %>%
+  group_by(Analysis, PlantType) %>%
+  summarise(
+    Mean = mean(DistanceToCentroid, na.rm = TRUE),
+    Median = median(DistanceToCentroid, na.rm = TRUE),
+    SD = sd(DistanceToCentroid, na.rm = TRUE),
+    N_sample = sum(!is.na(DistanceToCentroid)),
+    .groups = "drop"
+  )
+
+openxlsx::write.xlsx(
+  list(
+    "Dispersion_distance" = dispersion_all,
+    "Betadisper_ANOVA" = dispersion_anova_all,
+    "Dispersion_summary" = dispersion_summary
+  ),
+  file.path(table_dir, "02_Dispersion_Guild_TrophicMode.xlsx"),
+  overwrite = TRUE
+)
+
+p_disp <- ggplot(
+  dispersion_all,
+  aes(
+    x = PlantType,
+    y = DistanceToCentroid,
+    fill = PlantType
+  )
+) +
+  geom_boxplot(outlier.shape = NA, width = 0.55) +
+  geom_jitter(width = 0.15, size = 1.1, alpha = 0.45) +
+  facet_wrap(~ Analysis, scales = "free_y") +
+  scale_fill_manual(values = plant_cols) +
+  labs(
+    x = NULL,
+    y = "Distance to centroid",
+    title = "Functional dispersion of fungal Guild and Trophic Mode composition"
+  ) +
+  theme(
+    panel.grid = element_blank(),
+    legend.position = "none"
+  )
+
+save_plot_both(
+  p_disp,
+  "Fig_02_Dispersion_Guild_TrophicMode",
+  width = 8,
+  height = 5
+)
+
+
+## 12. Top 30 Guilds by effect size
+
+calc_feature_effect <- function(rel_df, feature_col) {
+  
+  sample_feature <- rel_df %>%
+    group_by(PlantType, Article, SampleID, .data[[feature_col]]) %>%
+    summarise(
+      RelativeAbundance = sum(RelativeAbundance, na.rm = TRUE),
+      .groups = "drop"
+    )
+  
+  all_features <- sort(unique(sample_feature[[feature_col]]))
+  
+  all_samples <- sample_feature %>%
+    select(PlantType, Article, SampleID) %>%
+    distinct()
+  
+  complete_df <- all_samples %>%
+    tidyr::crossing(
+      Feature = all_features
+    ) %>%
+    rename(!!feature_col := Feature) %>%
+    left_join(
+      sample_feature,
+      by = c("PlantType", "Article", "SampleID", feature_col)
+    ) %>%
+    mutate(
+      RelativeAbundance = ifelse(is.na(RelativeAbundance), 0, RelativeAbundance)
+    )
+  
+  article_mean <- complete_df %>%
+    group_by(Article, PlantType, .data[[feature_col]]) %>%
+    summarise(
+      MeanRelativeAbundance = mean(RelativeAbundance, na.rm = TRUE),
+      .groups = "drop"
+    )
+  
+  article_diff <- article_mean %>%
+    pivot_wider(
+      names_from = PlantType,
+      values_from = MeanRelativeAbundance,
+      values_fill = 0
+    ) %>%
+    mutate(
+      Difference_Invasive_minus_Native = Invasive - Native,
+      Direction = case_when(
+        Difference_Invasive_minus_Native > 0 ~ "Invasive higher",
+        Difference_Invasive_minus_Native < 0 ~ "Native higher",
+        TRUE ~ "No clear direction"
+      )
+    )
+  
+  effect_df <- complete_df %>%
+    group_by(.data[[feature_col]]) %>%
+    summarise(
+      Mean_Invasive = mean(RelativeAbundance[PlantType == "Invasive"], na.rm = TRUE),
+      Mean_Native = mean(RelativeAbundance[PlantType == "Native"], na.rm = TRUE),
+      Delta_Invasive_minus_Native = Mean_Invasive - Mean_Native,
+      log2FC_Invasive_vs_Native = log2((Mean_Invasive + pseudo_count) / (Mean_Native + pseudo_count)),
+      Hedges_g = hedges_g(
+        RelativeAbundance[PlantType == "Invasive"],
+        RelativeAbundance[PlantType == "Native"]
+      ),
+      Wilcox_p = wilcox_p_safe(
+        RelativeAbundance[PlantType == "Invasive"],
+        RelativeAbundance[PlantType == "Native"]
+      ),
+      .groups = "drop"
+    ) %>%
+    left_join(
+      article_diff %>%
+        group_by(.data[[feature_col]]) %>%
+        summarise(
+          Article_number = n(),
+          Positive_number = sum(Difference_Invasive_minus_Native > 0, na.rm = TRUE),
+          Negative_number = sum(Difference_Invasive_minus_Native < 0, na.rm = TRUE),
+          Zero_number = sum(Difference_Invasive_minus_Native == 0, na.rm = TRUE),
+          Positive_ratio = Positive_number / Article_number,
+          Negative_ratio = Negative_number / Article_number,
+          Direction_consistency = pmax(Positive_ratio, Negative_ratio),
+          Dominant_direction = case_when(
+            Positive_number > Negative_number ~ "Invasive higher",
+            Negative_number > Positive_number ~ "Native higher",
+            TRUE ~ "No clear direction"
+          ),
+          .groups = "drop"
+        ),
+      by = feature_col
+    ) %>%
+    mutate(
+      P_adj_BH = p.adjust(Wilcox_p, method = "BH"),
+      abs_Hedges_g = abs(Hedges_g)
+    ) %>%
+    arrange(desc(abs_Hedges_g), desc(Direction_consistency))
+  
+  list(
+    sample_complete = complete_df,
+    article_diff = article_diff,
+    effect = effect_df
+  )
+}
+
+guild_effect_res <- calc_feature_effect(guild_rel, "Guild")
+
+guild_effect <- guild_effect_res$effect
+
+guild_effect_top30 <- guild_effect %>%
+  filter(!is.na(Hedges_g)) %>%
+  slice_head(n = top_guild_n) %>%
+  mutate(
+    Guild = forcats::fct_reorder(Guild, Hedges_g),
+    Significant_flag = case_when(
+      !is.na(P_adj_BH) & P_adj_BH < 0.05 ~ "BH-adjusted p < 0.05",
+      !is.na(Wilcox_p) & Wilcox_p < 0.05 ~ "raw p < 0.05",
+      TRUE ~ "n.s."
+    )
+  )
+
+openxlsx::write.xlsx(
+  list(
+    "Guild_effect_all" = guild_effect,
+    "Guild_top30_effect" = guild_effect_top30,
+    "Guild_article_difference" = guild_effect_res$article_diff
+  ),
+  file.path(table_dir, "03_Guild_top30_effect_size.xlsx"),
+  overwrite = TRUE
+)
+
+p_guild_effect <- ggplot(
+  guild_effect_top30,
+  aes(
+    x = Hedges_g,
+    y = Guild,
+    size = Direction_consistency,
+    fill = Dominant_direction
+  )
+) +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  geom_point(
+    aes(shape = Significant_flag),
+    color = "black",
+    alpha = 0.85
+  ) +
+  scale_fill_manual(values = direction_cols) +
+  scale_shape_manual(
+    values = c(
+      "BH-adjusted p < 0.05" = 24,
+      "raw p < 0.05" = 21,
+      "n.s." = 21
+    )
+  ) +
+  scale_size_continuous(range = c(2.5, 7)) +
+  labs(
+    x = "Hedges' g: Invasive vs Native",
+    y = NULL,
+    size = "Direction consistency",
+    fill = "Dominant direction",
+    shape = "Wilcoxon test",
+    title = paste0("Top ", top_guild_n, " Guilds by effect size and consistency")
+  ) +
+  theme(
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor = element_blank()
+  )
+
+save_plot_both(
+  p_guild_effect,
+  "Fig_03_Top30_Guild_effect_size_direction_consistency",
+  width = 10,
+  height = 10
+)
+
+
+############################################################
+## 13. Overall trophic-mode composition
+## Includes all single and combined trophic modes
+
+############################################################
+
+trophic_mode_overall <- trophic_rel %>%
+  group_by(PlantType, TrophicMode) %>%
+  summarise(
+    MeanRelativeAbundance = mean(RelativeAbundance, na.rm = TRUE),
+    MedianRelativeAbundance = median(RelativeAbundance, na.rm = TRUE),
+    SD = sd(RelativeAbundance, na.rm = TRUE),
+    N_sample = sum(!is.na(RelativeAbundance)),
+    .groups = "drop"
+  ) %>%
+  group_by(PlantType) %>%
+  mutate(
+    MeanRelativeAbundance = MeanRelativeAbundance / sum(MeanRelativeAbundance, na.rm = TRUE)
+  ) %>%
+  ungroup() %>%
+  mutate(
+    PlantType = factor(PlantType, levels = c("Native", "Invasive"))
+  )
+
+trophic_cols <- make_trophic_colors(trophic_mode_overall$TrophicMode)
+
+openxlsx::write.xlsx(
+  trophic_mode_overall,
+  file.path(table_dir, "04_TrophicMode_overall_composition.xlsx"),
+  overwrite = TRUE
+)
+
+p_trophic_stack <- ggplot(
+  trophic_mode_overall,
+  aes(
+    x = PlantType,
+    y = MeanRelativeAbundance,
+    fill = TrophicMode
+  )
+) +
+  geom_col(width = 0.55, color = "white", linewidth = 0.3) +
+  scale_fill_manual(values = trophic_cols) +
+  scale_y_continuous(
+    labels = scales::percent_format(accuracy = 1),
+    expand = c(0, 0)
+  ) +
+  labs(
+    x = NULL,
+    y = "Mean relative abundance",
+    fill = "Trophic Mode",
+    title = "Overall composition of fungal Trophic Modes"
+  ) +
+  theme(
+    panel.grid = element_blank(),
+    axis.text.x = element_text(size = 12),
+    legend.position = "right"
+  )
+
+save_plot_both(
+  p_trophic_stack,
+  "Fig_04_TrophicMode_overall_composition_stacked_bar",
+  width = 8.5,
+  height = 5.8
+)
+
+
+## 14. Trophic-mode direction and consistency
+
+trophic_effect_res <- calc_feature_effect(trophic_rel, "TrophicMode")
+
+trophic_effect <- trophic_effect_res$effect %>%
+  filter(!is.na(Hedges_g)) %>%
+  mutate(
+    TrophicMode = forcats::fct_reorder(TrophicMode, Delta_Invasive_minus_Native)
+  )
+
+openxlsx::write.xlsx(
+  list(
+    "TrophicMode_effect_all" = trophic_effect_res$effect,
+    "TrophicMode_article_difference" = trophic_effect_res$article_diff,
+    "TrophicMode_sample_complete" = trophic_effect_res$sample_complete
+  ),
+  file.path(table_dir, "05_TrophicMode_effect_direction_consistency.xlsx"),
+  overwrite = TRUE
+)
+
+p_trophic_effect <- ggplot(
+  trophic_effect,
+  aes(
+    x = Delta_Invasive_minus_Native,
+    y = TrophicMode,
+    size = Direction_consistency,
+    fill = Dominant_direction
+  )
+) +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  geom_point(
+    shape = 21,
+    color = "black",
+    alpha = 0.85
+  ) +
+  scale_fill_manual(values = direction_cols) +
+  scale_size_continuous(range = c(3, 8)) +
+  labs(
+    x = "Difference in relative abundance: Invasive - Native",
+    y = NULL,
+    size = "Direction consistency",
+    fill = "Dominant direction",
+    title = "Trophic Mode differences: effect direction and consistency"
+  ) +
+  theme(
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor = element_blank()
+  )
+
+save_plot_both(
+  p_trophic_effect,
+  "Fig_05_TrophicMode_effect_direction_consistency",
+  width = 9.5,
+  height = max(5.5, 0.35 * nrow(trophic_effect))
+)
+
+
+## 15. Trophic-mode boxplots
+
+trophic_top_modes <- trophic_rel %>%
+  group_by(TrophicMode) %>%
+  summarise(
+    MeanRelativeAbundance = mean(RelativeAbundance, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(MeanRelativeAbundance)) %>%
+  pull(TrophicMode)
+
+trophic_box_data <- trophic_rel %>%
+  filter(TrophicMode %in% trophic_top_modes) %>%
+  mutate(
+    TrophicMode = factor(TrophicMode, levels = rev(trophic_top_modes))
+  )
+
+p_trophic_box <- ggplot(
+  trophic_box_data,
+  aes(
+    x = TrophicMode,
+    y = RelativeAbundance,
+    fill = PlantType
+  )
+) +
+  geom_boxplot(
+    outlier.shape = NA,
+    position = position_dodge(width = 0.8),
+    width = 0.65
+  ) +
+  coord_flip() +
+  scale_fill_manual(values = plant_cols) +
+  labs(
+    x = NULL,
+    y = "Relative abundance",
+    fill = "Plant type",
+    title = "Fungal Trophic Modes: Invasive vs Native"
+  ) +
+  theme(
+    panel.grid = element_blank()
+  )
+
+save_plot_both(
+  p_trophic_box,
+  "Fig_06_TrophicMode_boxplot_Invasive_vs_Native",
+  width = 9,
+  height = max(6, 0.35 * length(trophic_top_modes))
+)
+
+
+## 16. Save merged data
+
+openxlsx::write.xlsx(
+  list(
+    "Guild_relative_long" = guild_rel,
+    "TrophicMode_relative_long" = trophic_rel,
+    "Guild_matrix_metadata" = guild_matrix$meta,
+    "TrophicMode_matrix_metadata" = trophic_matrix$meta,
+    "Processing_log" = processing_log
+  ),
+  file.path(out_dir, "ITS_FUNGuild_selected_analysis_merged_data.xlsx"),
+  overwrite = TRUE
+)
+
+
+## 17. Completion summary
+
+message("============================================================")
+message("ITS FUNGuild selected analysis completed.")
+message("Output directory: ", out_dir)
+message("")
+message("Main figures:")
+message("1. Fig_01_Beta_distance_Guild_TrophicMode.pdf / .png")
+message("2. Fig_02_Dispersion_Guild_TrophicMode.pdf / .png")
+message("3. Fig_03_Top30_Guild_effect_size_direction_consistency.pdf / .png")
+message("4. Fig_04_TrophicMode_overall_composition_stacked_bar.pdf / .png")
+message("5. Fig_05_TrophicMode_effect_direction_consistency.pdf / .png")
+message("6. Fig_06_TrophicMode_boxplot_Invasive_vs_Native.pdf / .png")
+message("")
+message("Main tables:")
+message("1. 01_Beta_distance_Guild_TrophicMode.xlsx")
+message("2. 02_Dispersion_Guild_TrophicMode.xlsx")
+message("3. 03_Guild_top30_effect_size.xlsx")
+message("4. 04_TrophicMode_overall_composition.xlsx")
+message("5. 05_TrophicMode_effect_direction_consistency.xlsx")

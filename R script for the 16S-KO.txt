@@ -1,0 +1,811 @@
+############################################################
+## Core KO Functional Profile Plots
+## Compares native and invasive core KOs at pathway,
+## module, and ecological-category levels
+############################################################
+
+
+## 0. Packages
+
+packages <- c(
+  "readxl", "openxlsx", "dplyr", "tidyr", "stringr",
+  "ggplot2", "forcats", "scales", "purrr", "tibble",
+  "pheatmap"
+)
+
+new_packages <- packages[!(packages %in% installed.packages()[, "Package"])]
+
+if (length(new_packages) > 0) {
+  install.packages(new_packages)
+}
+
+lapply(packages, library, character.only = TRUE)
+
+
+## 1. Paths
+
+work_dir <- "E:/DesktopFiles/Function/KO/CNPS_KO_core_specific_analysis"
+
+pair_dir <- file.path(
+  work_dir,
+  "KO_pairwise_native_invasive_function_profile_no_NA"
+)
+
+pathway_file <- file.path(
+  pair_dir,
+  "Overall_pairwise_KEGG_pathway_comparison_summary.xlsx"
+)
+
+module_file <- file.path(
+  pair_dir,
+  "Core_Native_vs_Invasive",
+  "Tables",
+  "Figure_05_Module_bubble_data.xlsx"
+)
+
+out_dir <- file.path(
+  pair_dir,
+  "KO_core_Native_vs_Invasive_recommended_function_profile"
+)
+
+fig_dir <- file.path(out_dir, "Figures")
+table_dir <- file.path(out_dir, "Tables")
+
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+dir.create(fig_dir, showWarnings = FALSE, recursive = TRUE)
+dir.create(table_dir, showWarnings = FALSE, recursive = TRUE)
+
+if (!file.exists(pathway_file)) {
+  stop("Pathway summary file not found: ", pathway_file)
+}
+
+if (!file.exists(module_file)) {
+  warning("Module table not found; Figure 05 will be skipped: ", module_file)
+}
+
+
+## 2. Parameters
+
+target_pair <- "Core_Native_vs_Invasive"
+pair_label <- "Native core KO vs Invasive core KO"
+
+## Direction convention:
+## In the source pairwise table, Difference_in_proportion is:
+## Native - Invasive
+##
+## All downstream results are converted to:
+## Invasive - Native
+##
+## Therefore:
+## Positive values = higher in invasive core KOs
+## Negative values = higher in native core KOs
+
+direction_colors <- c(
+  "Invasive core KO higher" = "#B65F4A",
+  "Native core KO higher" = "#4F7C8A",
+  "Equal" = "grey70"
+)
+
+group_colors <- c(
+  "Invasive core KO" = "#B65F4A",
+  "Native core KO" = "#4F7C8A"
+)
+
+top_n_lollipop <- 25
+top_n_bar <- 25
+top_n_heatmap <- 30
+top_n_bubble <- 30
+top_n_module <- 25
+top_n_category <- 20
+
+
+## 3. Helper functions
+
+clean_colnames <- function(df) {
+  names(df) <- names(df) %>%
+    str_replace_all("\\s+", "_") %>%
+    str_replace_all("\\.", "_") %>%
+    str_replace_all("-", "_")
+  df
+}
+
+save_plot <- function(p, filename, width = 10, height = 7) {
+  ggsave(
+    filename = file.path(fig_dir, paste0(filename, ".pdf")),
+    plot = p,
+    width = width,
+    height = height
+  )
+  
+  ggsave(
+    filename = file.path(fig_dir, paste0(filename, ".png")),
+    plot = p,
+    width = width,
+    height = height,
+    dpi = 300
+  )
+}
+
+write_xlsx_safe <- function(x, filename) {
+  openxlsx::write.xlsx(
+    x,
+    file = file.path(table_dir, filename),
+    overwrite = TRUE
+  )
+}
+
+get_row_value_by_set <- function(row_df, prefix, target_keyword) {
+  cn <- names(row_df)
+  hit <- cn[str_detect(cn, paste0("^", prefix, "_.*", target_keyword))]
+  if (length(hit) == 0) {
+    return(NA_real_)
+  }
+  as.numeric(row_df[[hit[1]]])
+}
+
+classify_ecological_function <- function(x) {
+  x_low <- str_to_lower(x)
+  
+  case_when(
+    str_detect(x_low, "carbon metabolism|carbon fixation|glycolysis|citrate cycle|pyruvate|propanoate|butanoate|glyoxylate|dicarboxylate|starch|sucrose|galactose|fructose|mannose") ~
+      "Carbon metabolism",
+    
+    str_detect(x_low, "methane|methan") ~
+      "Methane / C1 metabolism",
+    
+    str_detect(x_low, "nitrogen|nitrate|nitrite|denitrification|ammonia") ~
+      "Nitrogen cycling",
+    
+    str_detect(x_low, "sulfur|sulfate|sulfide|thiosulfate") ~
+      "Sulfur cycling",
+    
+    str_detect(x_low, "phosphorus|phosphonate|phosphate|phosphotransferase") ~
+      "Phosphorus cycling",
+    
+    str_detect(x_low, "aromatic|benzoate|toluene|xylene|dioxin|naphthalene|polycyclic|chlorocyclohexane|chlorobenzene|aminobenzoate|caprolactam|ethylbenzene|styrene|nitrotoluene|bisphenol|xenobiotics") ~
+      "Aromatic / xenobiotic degradation",
+    
+    str_detect(x_low, "secondary metabolite|polyketide|terpenoid|alkaloid|phenylpropanoid|flavonoid|ansamycin|streptomycin|novobiocin|vancomycin|betalain|zeatin") ~
+      "Secondary metabolism",
+    
+    str_detect(x_low, "abc transporter|transporter|secretion|bacterial secretion|phosphotransferase system|pts") ~
+      "Transport and secretion",
+    
+    str_detect(x_low, "two-component|quorum|biofilm|chemotaxis|flagellar|motility") ~
+      "Signal transduction and motility",
+    
+    str_detect(x_low, "ribosome|dna replication|rna polymerase|homologous recombination|mismatch repair|base excision|nucleotide excision|aminoacyl|protein export|proteasome") ~
+      "Core cellular processes",
+    
+    str_detect(x_low, "oxidative phosphorylation|photosynthesis|energy metabolism|electron transport|sulfur relay") ~
+      "Energy metabolism",
+    
+    str_detect(x_low, "beta-lactam|drug resistance|antimicrobial|multidrug|efflux|cationic antimicrobial|resistance") ~
+      "Stress resistance",
+    
+    str_detect(x_low, "amino acid|alanine|aspartate|glutamate|glycine|serine|threonine|cysteine|methionine|valine|leucine|isoleucine|lysine|arginine|proline|histidine|phenylalanine|tyrosine|tryptophan") ~
+      "Amino acid metabolism",
+    
+    str_detect(x_low, "fatty acid|lipid|glycerolipid|glycerophospholipid|sphingolipid|linoleic|arachidonic") ~
+      "Lipid metabolism",
+    
+    str_detect(x_low, "cofactor|vitamin|folate|biotin|riboflavin|porphyrin|thiamine|nicotinate|nicotinamide|pantothenate|coa") ~
+      "Cofactor and vitamin metabolism",
+    
+    TRUE ~ "Other metabolism"
+  )
+}
+
+
+## 4. Read pathway comparison summary
+
+raw_pathway <- readxl::read_excel(pathway_file) %>%
+  as.data.frame()
+
+pathway_df <- raw_pathway %>%
+  clean_colnames()
+
+required_cols <- c(
+  "Pair",
+  "Pathway_name",
+  "Difference_in_KO_number",
+  "Difference_in_proportion",
+  "log2FC_proportion",
+  "Higher_in"
+)
+
+missing_cols <- setdiff(required_cols, names(pathway_df))
+
+if (length(missing_cols) > 0) {
+  stop(
+    "Overall_pairwise_KEGG_pathway_comparison_summary.xlsx is missing these columns: ",
+    paste(missing_cols, collapse = ", ")
+  )
+}
+
+pathway_core <- pathway_df %>%
+  filter(Pair == target_pair)
+
+if (nrow(pathway_core) == 0) {
+  stop("Pair was not found in the pathway summary: ", target_pair)
+}
+
+## Source difference for Core_Native_vs_Invasive = Native - Invasive
+## Multiply by -1 to standardize as Invasive - Native
+
+pathway_clean <- pathway_core %>%
+  rowwise() %>%
+  mutate(
+    Invasive_minus_Native_prop = -1 * Difference_in_proportion,
+    Invasive_minus_Native_log2FC = -1 * log2FC_proportion,
+    Invasive_minus_Native_KO_number = -1 * Difference_in_KO_number,
+    
+    Invasive_KO_number = get_row_value_by_set(cur_data(), "KO_number", "Invasive"),
+    Native_KO_number = get_row_value_by_set(cur_data(), "KO_number", "Native"),
+    Invasive_proportion = get_row_value_by_set(cur_data(), "Proportion", "Invasive"),
+    Native_proportion = get_row_value_by_set(cur_data(), "Proportion", "Native"),
+    
+    Total_KO_number = sum(c(Invasive_KO_number, Native_KO_number), na.rm = TRUE),
+    Mean_proportion = mean(c(Invasive_proportion, Native_proportion), na.rm = TRUE),
+    Abs_difference = abs(Invasive_minus_Native_prop),
+    
+    Direction = case_when(
+      Invasive_minus_Native_prop > 0 ~ "Invasive core KO higher",
+      Invasive_minus_Native_prop < 0 ~ "Native core KO higher",
+      TRUE ~ "Equal"
+    ),
+    
+    Ecological_category = classify_ecological_function(Pathway_name)
+  ) %>%
+  ungroup()
+
+write_xlsx_safe(
+  pathway_clean,
+  "00_Core_pathway_clean_Invasive_minus_Native.xlsx"
+)
+
+
+## Figure 01. Pathway difference lollipop plot
+
+lollipop_data <- pathway_clean %>%
+  arrange(desc(Abs_difference), desc(Total_KO_number)) %>%
+  slice_head(n = top_n_lollipop) %>%
+  mutate(
+    Pathway_label = str_wrap(Pathway_name, width = 45),
+    Pathway_label = fct_reorder(Pathway_label, Invasive_minus_Native_prop)
+  )
+
+write_xlsx_safe(
+  lollipop_data,
+  "Figure_01_pathway_difference_lollipop_data.xlsx"
+)
+
+p_lollipop <- ggplot(
+  lollipop_data,
+  aes(
+    x = Invasive_minus_Native_prop,
+    y = Pathway_label
+  )
+) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey40") +
+  geom_segment(
+    aes(
+      x = 0,
+      xend = Invasive_minus_Native_prop,
+      y = Pathway_label,
+      yend = Pathway_label,
+      color = Direction
+    ),
+    linewidth = 0.75
+  ) +
+  geom_point(
+    aes(
+      size = Total_KO_number,
+      color = Direction
+    ),
+    alpha = 0.9
+  ) +
+  scale_color_manual(values = direction_colors) +
+  scale_x_continuous(labels = percent_format(accuracy = 1)) +
+  scale_size_continuous(range = c(2.8, 9)) +
+  labs(
+    title = "KEGG pathway differences: Native core KO vs Invasive core KO",
+    subtitle = "Positive values indicate higher proportions in invasive core KOs; negative values indicate higher proportions in native core KOs",
+    x = "Difference in pathway proportion: Invasive core KO - Native core KO",
+    y = NULL,
+    color = "Direction",
+    size = "Total KO number"
+  ) +
+  theme_bw(base_size = 12) +
+  theme(
+    panel.grid.minor = element_blank(),
+    legend.position = "right"
+  )
+
+save_plot(
+  p_lollipop,
+  "Figure_01_core_pathway_difference_lollipop",
+  width = 12,
+  height = 8.5
+)
+
+
+## Figure 02. Two-sided pathway bar plot
+
+bar_data <- pathway_clean %>%
+  arrange(desc(Abs_difference), desc(Total_KO_number)) %>%
+  slice_head(n = top_n_bar) %>%
+  mutate(
+    Pathway_label = str_wrap(Pathway_name, width = 45),
+    Pathway_label = fct_reorder(Pathway_label, Invasive_minus_Native_prop)
+  )
+
+write_xlsx_safe(
+  bar_data,
+  "Figure_02_two_sided_pathway_bar_data.xlsx"
+)
+
+p_bar <- ggplot(
+  bar_data,
+  aes(
+    x = Invasive_minus_Native_prop,
+    y = Pathway_label,
+    fill = Direction
+  )
+) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey35") +
+  geom_col(width = 0.72, alpha = 0.92) +
+  scale_fill_manual(values = direction_colors) +
+  scale_x_continuous(labels = percent_format(accuracy = 1)) +
+  labs(
+    title = "Two-sided KEGG pathway profile of core KOs",
+    subtitle = "Right side = invasive core KO higher; left side = native core KO higher",
+    x = "Difference in pathway proportion: Invasive core KO - Native core KO",
+    y = NULL,
+    fill = "Direction"
+  ) +
+  theme_bw(base_size = 12) +
+  theme(
+    panel.grid.minor = element_blank(),
+    legend.position = "right"
+  )
+
+save_plot(
+  p_bar,
+  "Figure_02_core_two_sided_pathway_barplot",
+  width = 12,
+  height = 8.5
+)
+
+
+## Figure 03. Functional signature heatmap
+
+heatmap_data <- pathway_clean %>%
+  arrange(desc(Abs_difference), desc(Total_KO_number)) %>%
+  slice_head(n = top_n_heatmap) %>%
+  mutate(
+    Pathway_label = str_wrap(Pathway_name, width = 48)
+  ) %>%
+  select(Pathway_label, Invasive_minus_Native_prop) %>%
+  distinct() %>%
+  as.data.frame()
+
+rownames(heatmap_data) <- heatmap_data$Pathway_label
+heatmap_data$Pathway_label <- NULL
+colnames(heatmap_data) <- "Invasive core KO - Native core KO"
+
+write_xlsx_safe(
+  data.frame(Pathway = rownames(heatmap_data), heatmap_data),
+  "Figure_03_functional_signature_heatmap_data.xlsx"
+)
+
+max_abs <- max(abs(as.matrix(heatmap_data)), na.rm = TRUE)
+
+pdf(
+  file.path(fig_dir, "Figure_03_core_functional_signature_heatmap.pdf"),
+  width = 7,
+  height = 9
+)
+
+pheatmap(
+  as.matrix(heatmap_data),
+  cluster_rows = TRUE,
+  cluster_cols = FALSE,
+  color = colorRampPalette(c("#4F7C8A", "white", "#B65F4A"))(100),
+  breaks = seq(-max_abs, max_abs, length.out = 101),
+  fontsize_row = 8,
+  fontsize_col = 10,
+  main = "Core KO functional signature: Invasive - Native"
+)
+
+dev.off()
+
+png(
+  file.path(fig_dir, "Figure_03_core_functional_signature_heatmap.png"),
+  width = 2100,
+  height = 2700,
+  res = 300
+)
+
+pheatmap(
+  as.matrix(heatmap_data),
+  cluster_rows = TRUE,
+  cluster_cols = FALSE,
+  color = colorRampPalette(c("#4F7C8A", "white", "#B65F4A"))(100),
+  breaks = seq(-max_abs, max_abs, length.out = 101),
+  fontsize_row = 8,
+  fontsize_col = 10,
+  main = "Core KO functional signature: Invasive - Native"
+)
+
+dev.off()
+
+
+## Figure 04. Pathway contribution bubble plot
+
+bubble_data <- pathway_clean %>%
+  arrange(desc(Abs_difference), desc(Total_KO_number)) %>%
+  slice_head(n = top_n_bubble) %>%
+  mutate(
+    Pathway_label = str_wrap(Pathway_name, width = 48),
+    Comparison = "Native core KO vs Invasive core KO",
+    Pathway_label = fct_reorder(Pathway_label, Abs_difference)
+  )
+
+write_xlsx_safe(
+  bubble_data,
+  "Figure_04_pathway_contribution_bubble_data.xlsx"
+)
+
+p_bubble <- ggplot(
+  bubble_data,
+  aes(
+    x = Comparison,
+    y = Pathway_label
+  )
+) +
+  geom_point(
+    aes(
+      size = Total_KO_number,
+      fill = Invasive_minus_Native_prop
+    ),
+    shape = 21,
+    color = "grey25",
+    alpha = 0.9
+  ) +
+  scale_fill_gradient2(
+    low = "#4F7C8A",
+    mid = "white",
+    high = "#B65F4A",
+    midpoint = 0,
+    labels = percent_format(accuracy = 1)
+  ) +
+  scale_size_continuous(range = c(3, 11)) +
+  labs(
+    title = "Pathway contribution profile of core KOs",
+    subtitle = "Bubble color shows Invasive core KO - Native core KO; bubble size shows total KO number",
+    x = NULL,
+    y = NULL,
+    fill = "Invasive - Native",
+    size = "Total KO number"
+  ) +
+  theme_bw(base_size = 12) +
+  theme(
+    axis.text.x = element_text(angle = 0, hjust = 0.5),
+    panel.grid.minor = element_blank()
+  )
+
+save_plot(
+  p_bubble,
+  "Figure_04_core_pathway_contribution_bubble_plot",
+  width = 8,
+  height = 10
+)
+
+
+## Figure 05. Module-level functional fingerprint
+
+if (file.exists(module_file)) {
+  
+  module_raw <- readxl::read_excel(module_file) %>%
+    as.data.frame() %>%
+    clean_colnames()
+  
+  required_module_cols <- c("KO_set", "Module_name", "KO_number", "Proportion")
+  missing_module_cols <- setdiff(required_module_cols, names(module_raw))
+  
+  if (length(missing_module_cols) > 0) {
+    warning(
+      "Module table is missing these columns; Figure 05 will be skipped: ",
+      paste(missing_module_cols, collapse = ", ")
+    )
+  } else {
+    
+    module_pair <- module_raw %>%
+      mutate(
+        KO_set_type = case_when(
+          str_detect(KO_set, "^Invasive") ~ "Invasive",
+          str_detect(KO_set, "^Native") ~ "Native",
+          TRUE ~ "Other"
+        )
+      ) %>%
+      filter(KO_set_type %in% c("Invasive", "Native")) %>%
+      group_by(KO_set_type, Module_name) %>%
+      summarise(
+        KO_number = sum(KO_number, na.rm = TRUE),
+        Proportion = sum(Proportion, na.rm = TRUE),
+        .groups = "drop"
+      ) %>%
+      pivot_wider(
+        names_from = KO_set_type,
+        values_from = c(KO_number, Proportion),
+        values_fill = 0
+      ) %>%
+      mutate(
+        Invasive_minus_Native_prop = Proportion_Invasive - Proportion_Native,
+        Invasive_minus_Native_KO_number = KO_number_Invasive - KO_number_Native,
+        Total_KO_number = KO_number_Invasive + KO_number_Native,
+        Abs_difference = abs(Invasive_minus_Native_prop),
+        Direction = case_when(
+          Invasive_minus_Native_prop > 0 ~ "Invasive core KO higher",
+          Invasive_minus_Native_prop < 0 ~ "Native core KO higher",
+          TRUE ~ "Equal"
+        )
+      ) %>%
+      arrange(desc(Abs_difference), desc(Total_KO_number))
+    
+    write_xlsx_safe(
+      module_pair,
+      "Figure_05_module_pairwise_comparison_data.xlsx"
+    )
+    
+    module_plot_data <- module_pair %>%
+      slice_head(n = top_n_module) %>%
+      mutate(
+        Module_label = str_wrap(Module_name, width = 55),
+        Module_label = fct_reorder(Module_label, Invasive_minus_Native_prop)
+      )
+    
+    p_module <- ggplot(
+      module_plot_data,
+      aes(
+        x = Invasive_minus_Native_prop,
+        y = Module_label
+      )
+    ) +
+      geom_vline(xintercept = 0, linetype = "dashed", color = "grey40") +
+      geom_segment(
+        aes(
+          x = 0,
+          xend = Invasive_minus_Native_prop,
+          y = Module_label,
+          yend = Module_label,
+          color = Direction
+        ),
+        linewidth = 0.7
+      ) +
+      geom_point(
+        aes(
+          size = Total_KO_number,
+          color = Direction
+        ),
+        alpha = 0.9
+      ) +
+      scale_color_manual(values = direction_colors) +
+      scale_size_continuous(range = c(2.8, 9)) +
+      scale_x_continuous(labels = percent_format(accuracy = 1)) +
+      labs(
+        title = "KEGG module differences: Native core KO vs Invasive core KO",
+        subtitle = "Positive values indicate higher proportions in invasive core KOs; negative values indicate higher proportions in native core KOs",
+        x = "Difference in module proportion: Invasive core KO - Native core KO",
+        y = NULL,
+        color = "Direction",
+        size = "Total KO number"
+      ) +
+      theme_bw(base_size = 12) +
+      theme(
+        panel.grid.minor = element_blank(),
+        legend.position = "right"
+      )
+    
+    save_plot(
+      p_module,
+      "Figure_05_core_module_functional_fingerprint_lollipop",
+      width = 12,
+      height = 8.5
+    )
+  }
+  
+} else {
+  message("Module table not found; Figure 05 was skipped.")
+}
+
+
+## Figure 06. Ecological functional category summary plot
+
+category_long <- pathway_clean %>%
+  select(
+    Pathway_name,
+    Ecological_category,
+    Invasive_KO_number,
+    Native_KO_number
+  ) %>%
+  pivot_longer(
+    cols = c(Invasive_KO_number, Native_KO_number),
+    names_to = "Group",
+    values_to = "KO_number"
+  ) %>%
+  mutate(
+    Group = case_when(
+      Group == "Invasive_KO_number" ~ "Invasive core KO",
+      Group == "Native_KO_number" ~ "Native core KO",
+      TRUE ~ Group
+    )
+  ) %>%
+  group_by(Group, Ecological_category) %>%
+  summarise(
+    KO_number = sum(KO_number, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  group_by(Group) %>%
+  mutate(
+    Total_KO_number = sum(KO_number, na.rm = TRUE),
+    Proportion = KO_number / Total_KO_number
+  ) %>%
+  ungroup()
+
+category_compare <- category_long %>%
+  select(Group, Ecological_category, KO_number, Proportion) %>%
+  pivot_wider(
+    names_from = Group,
+    values_from = c(KO_number, Proportion),
+    values_fill = 0
+  ) %>%
+  mutate(
+    Invasive_minus_Native_prop =
+      `Proportion_Invasive core KO` - `Proportion_Native core KO`,
+    Invasive_minus_Native_KO_number =
+      `KO_number_Invasive core KO` - `KO_number_Native core KO`,
+    Total_KO_number =
+      `KO_number_Invasive core KO` + `KO_number_Native core KO`,
+    Abs_difference = abs(Invasive_minus_Native_prop),
+    Direction = case_when(
+      Invasive_minus_Native_prop > 0 ~ "Invasive core KO higher",
+      Invasive_minus_Native_prop < 0 ~ "Native core KO higher",
+      TRUE ~ "Equal"
+    )
+  ) %>%
+  arrange(desc(Abs_difference), desc(Total_KO_number))
+
+write_xlsx_safe(
+  category_long,
+  "Figure_06A_ecological_category_group_composition_data.xlsx"
+)
+
+write_xlsx_safe(
+  category_compare,
+  "Figure_06B_ecological_category_pairwise_difference_data.xlsx"
+)
+
+category_plot <- category_compare %>%
+  slice_head(n = top_n_category) %>%
+  mutate(
+    Ecological_category = fct_reorder(Ecological_category, Invasive_minus_Native_prop)
+  )
+
+p_category_diff <- ggplot(
+  category_plot,
+  aes(
+    x = Invasive_minus_Native_prop,
+    y = Ecological_category,
+    fill = Direction
+  )
+) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey35") +
+  geom_col(width = 0.7, alpha = 0.92) +
+  scale_fill_manual(values = direction_colors) +
+  scale_x_continuous(labels = percent_format(accuracy = 1)) +
+  labs(
+    title = "Ecological functional category differences of core KOs",
+    subtitle = "Right side = invasive core KO higher; left side = native core KO higher",
+    x = "Difference in category proportion: Invasive core KO - Native core KO",
+    y = NULL,
+    fill = "Direction"
+  ) +
+  theme_bw(base_size = 12) +
+  theme(
+    panel.grid.minor = element_blank(),
+    legend.position = "right"
+  )
+
+save_plot(
+  p_category_diff,
+  "Figure_06A_core_ecological_function_category_two_sided_barplot",
+  width = 10,
+  height = 7.5
+)
+
+
+## Figure 06B. Ecological category composition stacked bar
+
+category_top <- category_compare %>%
+  slice_head(n = top_n_category) %>%
+  pull(Ecological_category)
+
+category_comp_plot <- category_long %>%
+  filter(Ecological_category %in% category_top) %>%
+  mutate(
+    Group = factor(Group, levels = c("Native core KO", "Invasive core KO"))
+  )
+
+p_category_comp <- ggplot(
+  category_comp_plot,
+  aes(
+    x = Group,
+    y = Proportion,
+    fill = Ecological_category
+  )
+) +
+  geom_col(width = 0.72) +
+  scale_y_continuous(labels = percent_format(accuracy = 1)) +
+  scale_fill_brewer(palette = "Set3") +
+  labs(
+    title = "Ecological functional category composition of core KOs",
+    x = NULL,
+    y = "Proportion",
+    fill = "Ecological category"
+  ) +
+  theme_bw(base_size = 12) +
+  theme(
+    axis.text.x = element_text(angle = 25, hjust = 1),
+    panel.grid.minor = element_blank(),
+    legend.position = "right"
+  )
+
+save_plot(
+  p_category_comp,
+  "Figure_06B_core_ecological_function_category_composition_stacked_barplot",
+  width = 11,
+  height = 7
+)
+
+
+## 7. Export combined workbook
+
+summary_file <- file.path(
+  out_dir,
+  "Core_Native_vs_Invasive_function_profile_plot_data_summary.xlsx"
+)
+
+wb <- createWorkbook()
+
+add_sheet <- function(wb, sheet_name, data) {
+  addWorksheet(wb, sheet_name)
+  writeData(wb, sheet_name, data)
+  freezePane(wb, sheet_name, firstRow = TRUE)
+  setColWidths(wb, sheet_name, cols = 1:ncol(data), widths = "auto")
+}
+
+add_sheet(wb, "00_Pathway_clean", pathway_clean)
+add_sheet(wb, "01_Lollipop_data", lollipop_data)
+add_sheet(wb, "02_Two_sided_bar_data", bar_data)
+add_sheet(wb, "03_Heatmap_data", data.frame(Pathway = rownames(heatmap_data), heatmap_data))
+add_sheet(wb, "04_Pathway_bubble_data", bubble_data)
+
+if (exists("module_pair")) {
+  add_sheet(wb, "05_Module_pairwise", module_pair)
+}
+
+add_sheet(wb, "06A_Category_composition", category_long)
+add_sheet(wb, "06B_Category_difference", category_compare)
+
+saveWorkbook(wb, summary_file, overwrite = TRUE)
+
+
+## 8. Finish
+
+message("Core Native vs Invasive functional profile plots finished.")
+message("Output folder: ", out_dir)
+message("Figures folder: ", fig_dir)
+message("Tables folder: ", table_dir)
+message("Summary workbook: ", summary_file)

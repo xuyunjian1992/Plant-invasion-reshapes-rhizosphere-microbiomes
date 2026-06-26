@@ -1,0 +1,759 @@
+############################################################
+## CAMs Batch Analysis
+## Calculates βNTI, RCbray, NST, and NCM for paired datasets
+## Automatically matches phylogenetic trees and skips completed runs
+############################################################
+
+rm(list = ls())
+gc()
+
+
+## 1. Install and load packages
+cran_pkgs <- c(
+  "readxl", "openxlsx", "ape", "picante", "vegan",
+  "NST", "minpack.lm"
+)
+
+for (pkg in cran_pkgs) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    install.packages(pkg, dependencies = TRUE)
+  }
+  library(pkg, character.only = TRUE)
+}
+
+
+## 2. User settings
+work_dir <- "E:/\u684c\u9762/CAMs/16S-NI"
+setwd(work_dir)
+
+batch_out_dir <- file.path(work_dir, "CAMs_batch_results_lowmem")
+dir.create(batch_out_dir, showWarnings = FALSE, recursive = TRUE)
+
+tree_I_file <- file.path(work_dir, "16S-Irooted.tree.nwk")
+tree_N_file <- file.path(work_dir, "16S-Nrooted.tree.nwk")
+
+# Randomization settings
+rand_bNTI <- 999
+rand_RC   <- 999
+rand_NST  <- 1000
+
+# Random seed
+seed_num <- 12345
+set.seed(seed_num)
+
+# Use one worker to reduce memory use
+nworker <- 1
+
+# Maximum runtime per file (seconds)
+time_limit_sec <- 3600
+
+
+## 3. Check phylogenetic trees
+if (!file.exists(tree_I_file)) {
+  stop("Invasive phylogenetic tree not found: ", tree_I_file)
+}
+if (!file.exists(tree_N_file)) {
+  stop("Native phylogenetic tree not found: ", tree_N_file)
+}
+
+tree_I <- ape::read.tree(tree_I_file)
+tree_N <- ape::read.tree(tree_N_file)
+
+
+## 4. Locate OTU tables
+otu_files <- list.files(
+  path = work_dir,
+  pattern = "^(I16S|N16S)-\u6587\u7ae0.*\\.xlsx$",
+  full.names = TRUE
+)
+
+otu_files <- sort(otu_files)
+
+if (length(otu_files) == 0) {
+  stop("No matching I16S or N16S article Excel files were found.")
+}
+
+
+## 5. Utility functions
+get_tree_by_filename <- function(file_name, tree_I, tree_N) {
+  bn <- basename(file_name)
+  if (grepl("^I16S-", bn, ignore.case = TRUE)) {
+    return(list(tree = tree_I, tree_type = "Invasive", tree_file = "16S-Irooted.tree.nwk"))
+  } else if (grepl("^N16S-", bn, ignore.case = TRUE)) {
+    return(list(tree = tree_N, tree_type = "Native", tree_file = "16S-Nrooted.tree.nwk"))
+  } else {
+    return(NULL)
+  }
+}
+
+classify_process <- function(bnti, rc, sig_bnti = 2, sig_rc = 0.95) {
+  if (bnti > sig_bnti) {
+    return("Heterogeneous_selection")
+  } else if (bnti < -sig_bnti) {
+    return("Homogeneous_selection")
+  } else if (abs(bnti) <= sig_bnti && rc > sig_rc) {
+    return("Dispersal_limitation")
+  } else if (abs(bnti) <= sig_bnti && rc < -sig_rc) {
+    return("Homogenizing_dispersal")
+  } else {
+    return("Undominated")
+  }
+}
+
+extract_group_prefix <- function(x) {
+  sub("[0-9]+$", "", x)
+}
+
+
+## 6. Precheck each input file
+precheck_one_file <- function(otu_file, tree_obj) {
+  file_base <- tools::file_path_sans_ext(basename(otu_file))
+  
+  otu_raw <- try(readxl::read_excel(otu_file), silent = TRUE)
+  if (inherits(otu_raw, "try-error")) {
+    return(list(
+      ok = FALSE, file = file_base, reason = "Failed to read Excel file",
+      samples = NA, matched_otus = NA
+    ))
+  }
+  
+  otu_raw <- as.data.frame(otu_raw, check.names = FALSE)
+  
+  if (ncol(otu_raw) < 2) {
+    return(list(
+      ok = FALSE, file = file_base, reason = "The table contains fewer than two columns",
+      samples = NA, matched_otus = NA
+    ))
+  }
+  
+  colnames(otu_raw)[1] <- "OTU_ID"
+  otu_raw <- otu_raw[!is.na(otu_raw$OTU_ID) & otu_raw$OTU_ID != "", ]
+  
+  if (nrow(otu_raw) == 0) {
+    return(list(
+      ok = FALSE, file = file_base, reason = "The OTU table is empty",
+      samples = NA, matched_otus = 0
+    ))
+  }
+  
+  otu_mat <- otu_raw[, -1, drop = FALSE]
+  rownames(otu_mat) <- otu_raw$OTU_ID
+  otu_mat[] <- lapply(otu_mat, function(x) as.numeric(as.character(x)))
+  otu_mat[is.na(otu_mat)] <- 0
+  otu_mat <- as.matrix(otu_mat)
+  
+  otu_mat <- otu_mat[rowSums(otu_mat) > 0, , drop = FALSE]
+  if (nrow(otu_mat) < 2) {
+    return(list(
+      ok = FALSE, file = file_base, reason = "Fewer than two nonzero OTUs",
+      samples = NA, matched_otus = 0
+    ))
+  }
+  
+  comm0 <- t(otu_mat)
+  comm0 <- comm0[rowSums(comm0) > 0, , drop = FALSE]
+  
+  if (nrow(comm0) < 2) {
+    return(list(
+      ok = FALSE, file = file_base, reason = "Fewer than two samples",
+      samples = nrow(comm0), matched_otus = 0
+    ))
+  }
+  
+  matched_otus <- length(intersect(colnames(comm0), tree_obj$tip.label))
+  if (matched_otus < 2) {
+    return(list(
+      ok = FALSE, file = file_base, reason = "Fewer than two OTUs matched the phylogenetic tree",
+      samples = nrow(comm0), matched_otus = matched_otus
+    ))
+  }
+  
+  return(list(
+    ok = TRUE, file = file_base, reason = "OK",
+    samples = nrow(comm0), matched_otus = matched_otus
+  ))
+}
+
+
+## 7. Analyze one input file
+run_one_file <- function(otu_file, tree_obj, tree_label, tree_file_name,
+                         batch_out_dir, rand_bNTI, rand_RC, rand_NST,
+                         nworker, seed_num) {
+  
+  file_base <- tools::file_path_sans_ext(basename(otu_file))
+  out_dir   <- file.path(batch_out_dir, paste0(file_base, "_CAMs"))
+  dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+  
+  cat("Starting analysis:", file_base, "\n")
+  
+  ############################
+  ## 7.1 Read OTU table
+  ############################
+  otu_raw <- readxl::read_excel(otu_file)
+  otu_raw <- as.data.frame(otu_raw, check.names = FALSE)
+  
+  colnames(otu_raw)[1] <- "OTU_ID"
+  otu_raw <- otu_raw[!is.na(otu_raw$OTU_ID) & otu_raw$OTU_ID != "", ]
+  
+  otu_mat <- otu_raw[, -1, drop = FALSE]
+  rownames(otu_mat) <- otu_raw$OTU_ID
+  
+  otu_mat[] <- lapply(otu_mat, function(x) as.numeric(as.character(x)))
+  otu_mat[is.na(otu_mat)] <- 0
+  otu_mat <- as.matrix(otu_mat)
+  
+  otu_mat <- otu_mat[rowSums(otu_mat) > 0, , drop = FALSE]
+  
+  comm0 <- t(otu_mat)
+  comm0 <- comm0[rowSums(comm0) > 0, , drop = FALSE]
+  
+  write.csv(
+    comm0,
+    file.path(out_dir, "community_matrix_sample_by_OTU.csv"),
+    quote = FALSE
+  )
+  
+  ############################
+  ## 7.2 Match OTUs and prune the tree
+  ############################
+  common_otus <- intersect(colnames(comm0), tree_obj$tip.label)
+  
+  tree_sub <- ape::drop.tip(tree_obj, setdiff(tree_obj$tip.label, common_otus))
+  comm <- comm0[, common_otus, drop = FALSE]
+  comm <- comm[, tree_sub$tip.label, drop = FALSE]
+  
+  keep_otu <- colSums(comm) > 0
+  comm <- comm[, keep_otu, drop = FALSE]
+  tree_sub <- ape::drop.tip(tree_sub, setdiff(tree_sub$tip.label, colnames(comm)))
+  comm <- comm[, tree_sub$tip.label, drop = FALSE]
+  
+  ape::write.tree(tree_sub, file = file.path(out_dir, "matched_subtree.nwk"))
+  
+  group_prefix <- unique(extract_group_prefix(rownames(comm)))
+  n_groups <- length(group_prefix)
+  note <- if (n_groups <= 1) "Single group; within-group analysis only" else "Within-group analysis available"
+  
+  match_info <- data.frame(
+    Metric = c("Tree_type", "Tree_file", "OTU_in_table", "Tip_in_tree",
+               "Matched_OTU", "Samples", "Detected_groups", "Note"),
+    Value  = c(tree_label, tree_file_name, nrow(otu_mat), length(tree_obj$tip.label),
+               ncol(comm), nrow(comm), n_groups, note),
+    stringsAsFactors = FALSE
+  )
+  write.csv(
+    match_info,
+    file.path(out_dir, "tree_otu_match_summary.csv"),
+    row.names = FALSE,
+    quote = FALSE
+  )
+  
+  cat("Samples =", nrow(comm), "; OTUs =", ncol(comm), "\n")
+  
+  ############################
+  ## 7.3 Calculate βNTI using online mean and variance
+  ############################
+  set.seed(seed_num)
+  
+  phylo_dist <- cophenetic(tree_sub)
+  
+  bmntd_obs <- as.matrix(
+    picante::comdistnt(
+      comm = comm,
+      dis = phylo_dist,
+      abundance.weighted = TRUE,
+      exclude.conspecifics = FALSE
+    )
+  )
+  
+  n_samp <- nrow(comm)
+  
+  rand_mean <- matrix(0, n_samp, n_samp)
+  rand_M2   <- matrix(0, n_samp, n_samp)
+  
+  for (i in 1:rand_bNTI) {
+    rand_name <- sample(colnames(phylo_dist))
+    dis_rand <- phylo_dist
+    colnames(dis_rand) <- rand_name
+    rownames(dis_rand) <- rand_name
+    
+    rand_mat <- as.matrix(
+      picante::comdistnt(
+        comm = comm,
+        dis = dis_rand,
+        abundance.weighted = TRUE,
+        exclude.conspecifics = FALSE
+      )
+    )
+    
+    if (i == 1) {
+      rand_mean <- rand_mat
+      rand_M2[,] <- 0
+    } else {
+      delta <- rand_mat - rand_mean
+      rand_mean <- rand_mean + delta / i
+      delta2 <- rand_mat - rand_mean
+      rand_M2 <- rand_M2 + delta * delta2
+    }
+    
+    rm(dis_rand, rand_mat)
+    if (i %% 20 == 0) gc()
+  }
+  
+  rand_sd <- sqrt(rand_M2 / (rand_bNTI - 1))
+  rand_sd[rand_sd == 0] <- NA
+  
+  bNTI <- (bmntd_obs - rand_mean) / rand_sd
+  diag(bNTI) <- 0
+  bNTI[is.na(bNTI)] <- 0
+  rownames(bNTI) <- rownames(comm)
+  colnames(bNTI) <- rownames(comm)
+  
+  write.csv(
+    bNTI,
+    file.path(out_dir, "bNTI_matrix.csv"),
+    quote = FALSE
+  )
+  
+  rm(phylo_dist, bmntd_obs, rand_mean, rand_M2, rand_sd)
+  gc()
+  
+  ############################
+  ## 7.4 Calculate RCbray using online accumulation
+  ############################
+  set.seed(seed_num)
+  
+  dt_obs <- as.matrix(vegan::vegdist(comm, method = "bray", binary = FALSE))
+  alpha_count <- matrix(0, nrow(dt_obs), ncol(dt_obs))
+  
+  prob_species   <- colSums(comm > 0)
+  prob_abundance <- colSums(comm)
+  species_num    <- rowSums(comm > 0)
+  sample_size    <- rowSums(comm)
+  
+  for (i in 1:rand_RC) {
+    comm_rand <- matrix(0, nrow = nrow(comm), ncol = ncol(comm))
+    rownames(comm_rand) <- rownames(comm)
+    colnames(comm_rand) <- colnames(comm)
+    
+    for (j in 1:nrow(comm)) {
+      id_species <- sample(
+        x = 1:ncol(comm),
+        size = species_num[j],
+        replace = FALSE,
+        prob = prob_species
+      )
+      
+      if ((sample_size[j] - species_num[j]) > 0) {
+        count <- sample(
+          x = id_species,
+          size = sample_size[j] - species_num[j],
+          replace = TRUE,
+          prob = prob_abundance[id_species]
+        )
+        tab_count <- table(count)
+        comm_rand[j, as.numeric(names(tab_count))] <- as.vector(tab_count)
+      }
+      
+      comm_rand[j, id_species] <- comm_rand[j, id_species] + 1
+    }
+    
+    dt_rand <- as.matrix(vegan::vegdist(comm_rand, method = "bray", binary = FALSE))
+    alpha_count <- alpha_count + ((dt_rand < dt_obs) + 0.5 * (dt_rand == dt_obs))
+    
+    rm(comm_rand, dt_rand)
+    if (i %% 20 == 0) gc()
+  }
+  
+  alpha_mat <- alpha_count / rand_RC
+  RCbray <- (alpha_mat - 0.5) * 2
+  diag(RCbray) <- 0
+  rownames(RCbray) <- rownames(comm)
+  colnames(RCbray) <- rownames(comm)
+  
+  write.csv(
+    RCbray,
+    file.path(out_dir, "RCbray_matrix.csv"),
+    quote = FALSE
+  )
+  
+  rm(dt_obs, alpha_count, alpha_mat, prob_species, prob_abundance, species_num, sample_size)
+  gc()
+  
+  ############################
+  ## 7.5 Classify assembly processes
+  ############################
+  sample_names <- rownames(comm)
+  pair_index <- which(upper.tri(bNTI), arr.ind = TRUE)
+  
+  pair_df <- data.frame(
+    Sample1 = sample_names[pair_index[, 1]],
+    Sample2 = sample_names[pair_index[, 2]],
+    bNTI    = bNTI[upper.tri(bNTI)],
+    RCbray  = RCbray[upper.tri(RCbray)],
+    stringsAsFactors = FALSE
+  )
+  
+  pair_df$Process <- mapply(classify_process, pair_df$bNTI, pair_df$RCbray)
+  
+  write.csv(
+    pair_df,
+    file.path(out_dir, "bNTI_RCbray_pairwise.csv"),
+    row.names = FALSE,
+    quote = FALSE
+  )
+  
+  process_summary <- as.data.frame(table(pair_df$Process), stringsAsFactors = FALSE)
+  colnames(process_summary) <- c("Process", "Pair_count")
+  process_summary$Proportion <- process_summary$Pair_count / sum(process_summary$Pair_count)
+  
+  write.csv(
+    process_summary,
+    file.path(out_dir, "bNTI_RCbray_process_summary.csv"),
+    row.names = FALSE,
+    quote = FALSE
+  )
+  
+  ############################
+  ## 7.6 Calculate NST
+  ############################
+  group_df <- data.frame(
+    Group = rep("All", nrow(comm)),
+    row.names = rownames(comm),
+    check.names = FALSE
+  )
+  
+  set.seed(seed_num)
+  nst_res <- NST::tNST(
+    comm = comm,
+    group = group_df,
+    rand = rand_NST,
+    dist.method = "bray",
+    abundance.weighted = TRUE,
+    null.model = "PF",
+    between.group = FALSE,
+    SES = FALSE,
+    RC = FALSE,
+    nworker = nworker
+  )
+  
+  if (!is.null(nst_res$index.pair)) {
+    write.csv(
+      as.data.frame(nst_res$index.pair),
+      file.path(out_dir, "NST_pairwise.csv"),
+      row.names = FALSE
+    )
+  } else if (!is.null(nst_res$details)) {
+    write.csv(
+      as.data.frame(nst_res$details),
+      file.path(out_dir, "NST_pairwise.csv"),
+      row.names = FALSE
+    )
+  }
+  
+  wb_nst <- openxlsx::createWorkbook()
+  
+  if (!is.null(nst_res$index.grp)) {
+    openxlsx::addWorksheet(wb_nst, "index.grp")
+    openxlsx::writeData(wb_nst, "index.grp", as.data.frame(nst_res$index.grp))
+  }
+  if (!is.null(nst_res$summary)) {
+    openxlsx::addWorksheet(wb_nst, "summary")
+    openxlsx::writeData(wb_nst, "summary", as.data.frame(nst_res$summary))
+  }
+  if (!is.null(nst_res$NST.i)) {
+    openxlsx::addWorksheet(wb_nst, "NST.i")
+    openxlsx::writeData(wb_nst, "NST.i", as.data.frame(nst_res$NST.i))
+  }
+  if (!is.null(nst_res$details)) {
+    openxlsx::addWorksheet(wb_nst, "details")
+    openxlsx::writeData(wb_nst, "details", as.data.frame(nst_res$details))
+  }
+  if (!is.null(nst_res$index.pair.grp)) {
+    openxlsx::addWorksheet(wb_nst, "index.pair.grp")
+    openxlsx::writeData(wb_nst, "index.pair.grp", as.data.frame(nst_res$index.pair.grp))
+  }
+  
+  openxlsx::saveWorkbook(
+    wb_nst,
+    file.path(out_dir, "NST_summary.xlsx"),
+    overwrite = TRUE
+  )
+  
+  rm(group_df, nst_res, wb_nst)
+  gc()
+  
+  ############################
+  ## 7.7 Fit the neutral community model
+  ############################
+  rel_comm <- sweep(comm, 1, rowSums(comm), "/")
+  rel_comm[is.na(rel_comm)] <- 0
+  
+  p_vec    <- colMeans(rel_comm)
+  freq_vec <- colSums(comm > 0) / nrow(comm)
+  N_mean   <- mean(rowSums(comm))
+  
+  ncm_df <- data.frame(
+    OTU  = colnames(comm),
+    p    = p_vec,
+    freq = freq_vec,
+    stringsAsFactors = FALSE
+  )
+  
+  ncm_df <- ncm_df[ncm_df$p > 0, ]
+  ncm_df <- ncm_df[is.finite(ncm_df$p) & is.finite(ncm_df$freq), ]
+  
+  neutral_fun <- function(m, p, N) {
+    1 - pbeta(q = 1 / N, shape1 = N * m * p, shape2 = N * m * (1 - p))
+  }
+  
+  fit_ncm <- try(
+    minpack.lm::nlsLM(
+      freq ~ 1 - pbeta(
+        q = 1 / N_mean,
+        shape1 = N_mean * m * p,
+        shape2 = N_mean * m * (1 - p)
+      ),
+      data = ncm_df,
+      start = list(m = 0.1),
+      control = minpack.lm::nls.lm.control(maxiter = 500)
+    ),
+    silent = TRUE
+  )
+  
+  if (inherits(fit_ncm, "try-error")) {
+    warning(paste0(file_base, ": NCM fitting failed"))
+    
+    ncm_df$pred  <- NA
+    ncm_df$resid <- NA
+    ncm_df$class <- NA
+    
+    ncm_sum <- data.frame(
+      Parameter = c("m", "Nm", "R2", "Samples", "OTUs"),
+      Value = c(NA, NA, NA, nrow(comm), ncol(comm))
+    )
+  } else {
+    m_est <- coef(fit_ncm)[["m"]]
+    pred  <- neutral_fun(m_est, ncm_df$p, N_mean)
+    
+    ncm_df$pred  <- pred
+    ncm_df$resid <- ncm_df$freq - ncm_df$pred
+    
+    n_samp <- nrow(comm)
+    ncm_df$lower <- pmax(0, ncm_df$pred - 1.96 * sqrt(ncm_df$pred * (1 - ncm_df$pred) / n_samp))
+    ncm_df$upper <- pmin(1, ncm_df$pred + 1.96 * sqrt(ncm_df$pred * (1 - ncm_df$pred) / n_samp))
+    
+    ncm_df$class <- ifelse(
+      ncm_df$freq > ncm_df$upper, "Above",
+      ifelse(ncm_df$freq < ncm_df$lower, "Below", "Neutral")
+    )
+    
+    ss_res <- sum((ncm_df$freq - ncm_df$pred)^2)
+    ss_tot <- sum((ncm_df$freq - mean(ncm_df$freq))^2)
+    r2 <- 1 - ss_res / ss_tot
+    
+    ncm_sum <- data.frame(
+      Parameter = c("m", "Nm", "R2", "Samples", "OTUs"),
+      Value = c(m_est, N_mean * m_est, r2, nrow(comm), ncol(comm))
+    )
+  }
+  
+  write.csv(
+    ncm_df,
+    file.path(out_dir, "NCM_taxa_fit.csv"),
+    row.names = FALSE,
+    quote = FALSE
+  )
+  
+  write.csv(
+    ncm_sum,
+    file.path(out_dir, "NCM_fit_summary.csv"),
+    row.names = FALSE,
+    quote = FALSE
+  )
+  
+  ############################
+  ## 7.8 Export summary tables
+  ############################
+  wb <- openxlsx::createWorkbook()
+  
+  openxlsx::addWorksheet(wb, "match_summary")
+  openxlsx::writeData(wb, "match_summary", match_info)
+  
+  openxlsx::addWorksheet(wb, "bNTI_pairwise")
+  openxlsx::writeData(wb, "bNTI_pairwise", pair_df)
+  
+  openxlsx::addWorksheet(wb, "process_summary")
+  openxlsx::writeData(wb, "process_summary", process_summary)
+  
+  openxlsx::addWorksheet(wb, "NCM_fit_summary")
+  openxlsx::writeData(wb, "NCM_fit_summary", ncm_sum)
+  
+  openxlsx::addWorksheet(wb, "NCM_taxa_fit")
+  openxlsx::writeData(wb, "NCM_taxa_fit", ncm_df)
+  
+  openxlsx::saveWorkbook(
+    wb,
+    file.path(out_dir, "CAMs_summary_tables.xlsx"),
+    overwrite = TRUE
+  )
+  
+  res_out <- data.frame(
+    File = file_base,
+    Type = tree_label,
+    Tree = tree_file_name,
+    Status = "Success",
+    Note = note,
+    Samples = nrow(comm),
+    Matched_OTUs = ncol(comm),
+    Output_dir = out_dir,
+    stringsAsFactors = FALSE
+  )
+  
+  rm(
+    otu_raw, otu_mat, comm0, comm, tree_sub,
+    bNTI, RCbray, pair_df, process_summary,
+    rel_comm, p_vec, freq_vec, N_mean, ncm_df, ncm_sum,
+    fit_ncm, wb, match_info
+  )
+  gc()
+  
+  cat("Completed:", file_base, "\n")
+  return(res_out)
+}
+
+
+## 8. Run batch analysis
+result_list <- vector("list", length(otu_files))
+
+for (i in seq_along(otu_files)) {
+  otu_file <- otu_files[i]
+  file_base <- tools::file_path_sans_ext(basename(otu_file))
+  out_dir_check <- file.path(batch_out_dir, paste0(file_base, "_CAMs"))
+  
+  if (dir.exists(out_dir_check)) {
+    cat("Skipped (results already exist):", file_base, "\n")
+    result_list[[i]] <- data.frame(
+      File = file_base,
+      Type = NA,
+      Tree = NA,
+      Status = "Skipped",
+      Note = "Output directory already exists",
+      Samples = NA,
+      Matched_OTUs = NA,
+      Output_dir = out_dir_check,
+      stringsAsFactors = FALSE
+    )
+    gc()
+    next
+  }
+  
+  tree_info <- get_tree_by_filename(otu_file, tree_I, tree_N)
+  
+  if (is.null(tree_info)) {
+    result_list[[i]] <- data.frame(
+      File = file_base,
+      Type = NA,
+      Tree = NA,
+      Status = "Skipped",
+      Note = "Unable to identify tree type from the filename",
+      Samples = NA,
+      Matched_OTUs = NA,
+      Output_dir = NA,
+      stringsAsFactors = FALSE
+    )
+    gc()
+    next
+  }
+  
+  precheck <- precheck_one_file(otu_file, tree_info$tree)
+  
+  if (!isTRUE(precheck$ok)) {
+    cat("Skipped:", file_base, "->", precheck$reason, "\n")
+    result_list[[i]] <- data.frame(
+      File = file_base,
+      Type = tree_info$tree_type,
+      Tree = tree_info$tree_file,
+      Status = "Skipped",
+      Note = precheck$reason,
+      Samples = precheck$samples,
+      Matched_OTUs = precheck$matched_otus,
+      Output_dir = NA,
+      stringsAsFactors = FALSE
+    )
+    gc()
+    next
+  }
+  
+  res <- tryCatch(
+    {
+      setTimeLimit(cpu = Inf, elapsed = time_limit_sec, transient = TRUE)
+      on.exit(setTimeLimit(cpu = Inf, elapsed = Inf, transient = FALSE), add = TRUE)
+      
+      run_one_file(
+        otu_file = otu_file,
+        tree_obj = tree_info$tree,
+        tree_label = tree_info$tree_type,
+        tree_file_name = tree_info$tree_file,
+        batch_out_dir = batch_out_dir,
+        rand_bNTI = rand_bNTI,
+        rand_RC = rand_RC,
+        rand_NST = rand_NST,
+        nworker = nworker,
+        seed_num = seed_num
+      )
+    },
+    error = function(e) {
+      msg <- conditionMessage(e)
+      if (grepl("reached elapsed time limit", msg, fixed = TRUE)) {
+        cat("Skipped after timeout:", file_base, "\n")
+        return(data.frame(
+          File = file_base,
+          Type = tree_info$tree_type,
+          Tree = tree_info$tree_file,
+          Status = "Skipped",
+          Note = "The file exceeded the one-hour runtime limit",
+          Samples = precheck$samples,
+          Matched_OTUs = precheck$matched_otus,
+          Output_dir = NA,
+          stringsAsFactors = FALSE
+        ))
+      } else {
+        cat("Failed:", file_base, "->", msg, "\n")
+        return(data.frame(
+          File = file_base,
+          Type = tree_info$tree_type,
+          Tree = tree_info$tree_file,
+          Status = "Failed",
+          Note = msg,
+          Samples = precheck$samples,
+          Matched_OTUs = precheck$matched_otus,
+          Output_dir = NA,
+          stringsAsFactors = FALSE
+        ))
+      }
+    },
+    finally = {
+      setTimeLimit(cpu = Inf, elapsed = Inf, transient = FALSE)
+      gc()
+    }
+  )
+  
+  result_list[[i]] <- res
+  rm(res, precheck, tree_info)
+  gc()
+}
+
+
+## 9. Export batch log
+batch_log <- do.call(rbind, result_list)
+
+write.csv(
+  batch_log,
+  file.path(batch_out_dir, "batch_run_log.csv"),
+  row.names = FALSE,
+  quote = FALSE
+)
+
+gc()
+
+message("All analyses completed. Results were saved to: ", batch_out_dir)
