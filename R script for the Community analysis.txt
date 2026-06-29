@@ -1,678 +1,3938 @@
-############################################################
-## Batch Community Diversity Analysis
-##
-## This script processes paired invasive/native OTU tables
-## from multiple studies and calculates alpha diversity,
-## beta diversity, Bray-Curtis distances, and article-level
-## PERMANOVA statistics.
-##
-## Expected file names:
-##   I16S-Article1.xlsx
-##   N16S-Article1.xlsx 
-##
-## Outputs:
-##   - Sample-level alpha diversity
-##   - Sample-level beta diversity metrics
-##   - Plant-group-level summary tables
-##   - Article-level PERMANOVA and beta-diversity summaries
-##   - Bray-Curtis distance matrices
-############################################################
+#!/usr/bin/env Rscript
 
-## Required packages ----------------------------------------------------------
+# ==============================================================================
+# Cross-study alpha- and beta-diversity analysis for paired invasive/native
+# rhizosphere microbiome datasets
+#
+# Designed for GitHub and reproducible use with either 16S or ITS OTU/ASV tables.
+#
+# Expected file names:
+#   I16S-文章1.xlsx / N16S-文章1.xlsx
+#   IITS-文章1.xlsx / NITS-文章1.xlsx
+#
+# Core statistical design
+# ------------------------------------------------------------------------------
+# 1. Invasive and native tables are merged within each study before analysis.
+# 2. Alpha diversity is calculated after removing only all-zero features.
+# 3. Beta diversity is calculated after joint within-study feature filtering
+#    and total-sum scaling to relative abundance.
+# 4. Samples are nested within PlantGroup; PlantGroup is nested within Study.
+# 5. Alpha inference uses within-study z scores and mixed-effects models:
+#
+#      Alpha_z ~ Status + (1 | Study) + (1 | PlantGroup)
+#
+# 6. Study-level raw alpha differences and Hedges' g are calculated from
+#    equally weighted PlantGroup means, not pooled samples.
+# 7. Beta analyses use PlantGroup centroid compositions as ecological units.
+# 8. Corrected Delta Bray-Curtis is:
+#
+#      mean(between-status Bray distance)
+#      - mean(mean(within-invasive), mean(within-native))
+#
+# 9. Study-level PERMANOVA and beta dispersion are performed on PlantGroup
+#    centroid Bray-Curtis distances.
+# 10. Optional global partial dbRDA controls for Study:
+#
+#      community ~ Status + Condition(Study)
+#
+# Direction convention
+# ------------------------------------------------------------------------------
+# All contrasts are Invasive - Native.
+# Positive alpha estimates indicate higher diversity under invasive plants.
+# Positive Delta Bray-Curtis indicates that between-status dissimilarity
+# exceeds average within-status heterogeneity.
+#
+# IMPORTANT
+# ------------------------------------------------------------------------------
+# PlantGroup is inferred from sample names unless a manual metadata file is
+# supplied. Always inspect the exported metadata diagnostic before interpreting
+# results.
+# ==============================================================================
 
-required_pkgs <- c(
-  "readxl", "openxlsx", "vegan", "dplyr", "tibble",
-  "tidyr", "stringr", "purrr"
+
+# ==============================================================================
+# 1. USER CONFIGURATION
+# ==============================================================================
+
+MARKER <- "16S"  # Choose "16S" or "ITS"
+
+INPUT_DIR <- if (MARKER == "16S") {
+  "D:/OneDrive/Desktop/Community/16S-NI"
+} else {
+  "D:/OneDrive/Desktop/Community/ITS-NI"
+}
+
+OUTPUT_DIR <- file.path(
+  INPUT_DIR,
+  paste0(MARKER, "_alpha_beta_analysis")
 )
 
-installed_pkgs <- rownames(installed.packages())
-for (pkg in required_pkgs) {
-  if (!pkg %in% installed_pkgs) {
-    install.packages(pkg, dependencies = TRUE)
-  }
+# Optional manual metadata file.
+# Required sheet: "metadata"
+# Required columns: Study, SampleID, Status, PlantGroup
+MANUAL_METADATA_FILE <- file.path(
+  INPUT_DIR,
+  paste0(MARKER, "_sample_metadata.xlsx")
+)
+
+# Alpha-diversity settings
+RAREFY_ALPHA <- FALSE
+MIN_LIBRARY_SIZE <- 1000
+
+# Beta-diversity feature filtering within each study
+BETA_MIN_TOTAL_COUNT <- 5
+BETA_MIN_PREVALENCE <- 2
+
+# Resampling settings
+N_BOOT <- 999
+N_PERM <- 999
+
+# Optional global analysis.
+# Use only when feature IDs are comparable across studies.
+RUN_GLOBAL_PARTIAL_DBRDA <- TRUE
+
+# Standardized alpha plot range
+STANDARDIZED_Y_MIN <- -3.5
+STANDARDIZED_Y_MAX <- 3.5
+
+# Plot colors
+STATUS_COLORS <- c(
+  "Native" = "#8FA8D2",
+  "Invasive" = "#D9A16F"
+)
+
+
+# ==============================================================================
+# 2. PACKAGE CHECK
+# ==============================================================================
+
+required_packages <- c(
+  "readxl",
+  "openxlsx",
+  "dplyr",
+  "tidyr",
+  "stringr",
+  "purrr",
+  "tibble",
+  "vegan",
+  "lme4",
+  "lmerTest",
+  "metafor",
+  "patchwork",
+  "permute",
+  "ggplot2"
+)
+
+missing_packages <- required_packages[
+  !vapply(
+    required_packages,
+    requireNamespace,
+    quietly = TRUE,
+    FUN.VALUE = logical(1)
+  )
+]
+
+if (length(missing_packages) > 0) {
+  stop(
+    "Install the following packages before running this script:\n",
+    paste(
+      sprintf('install.packages("%s")', missing_packages),
+      collapse = "\n"
+    )
+  )
 }
 
 suppressPackageStartupMessages({
   library(readxl)
   library(openxlsx)
-  library(vegan)
   library(dplyr)
-  library(tibble)
   library(tidyr)
   library(stringr)
   library(purrr)
+  library(tibble)
+  library(vegan)
+  library(lme4)
+  library(lmerTest)
+  library(metafor)
+  library(patchwork)
+  library(permute)
+  library(ggplot2)
 })
 
+set.seed(20260628)
 options(stringsAsFactors = FALSE)
 
 
-## User settings --------------------------------------------------------------
+# ==============================================================================
+# 3. OUTPUT DIRECTORIES
+# ==============================================================================
 
-workdir <- "E:/桌面/Community/16S-NI"
+FIGURE_DIR <- file.path(OUTPUT_DIR, "figures")
+TABLE_DIR <- file.path(OUTPUT_DIR, "tables")
+STUDY_DIR <- file.path(OUTPUT_DIR, "per_study")
+OBJECT_DIR <- file.path(OUTPUT_DIR, "r_objects")
 
-min_total_count <- 5
-min_prevalence <- 2
-perm_n <- 999
+dir.create(FIGURE_DIR, recursive = TRUE, showWarnings = FALSE)
+dir.create(TABLE_DIR, recursive = TRUE, showWarnings = FALSE)
+dir.create(STUDY_DIR, recursive = TRUE, showWarnings = FALSE)
+dir.create(OBJECT_DIR, recursive = TRUE, showWarnings = FALSE)
 
-output_dir_name <- "Batch_Community_ArticlePair_Results"
 
+# ==============================================================================
+# 4. GENERAL HELPERS
+# ==============================================================================
 
-## Input files ----------------------------------------------------------------
+metric_levels <- c("Chao1", "Richness", "Shannon", "Simpson")
 
-if (!dir.exists(workdir)) {
-  stop("Working directory does not exist: ", workdir)
+metric_labels <- c(
+  "Chao1" = "Chao1",
+  "Richness" = "Observed OTUs",
+  "Shannon" = "Shannon",
+  "Simpson" = "Simpson"
+)
+
+study_number <- function(x) {
+  suppressWarnings(
+    as.numeric(
+      stringr::str_extract(as.character(x), "\\d+")
+    )
+  )
 }
 
-setwd(workdir)
+p_to_star <- function(p) {
+  dplyr::case_when(
+    is.na(p) ~ "NA",
+    p < 0.001 ~ "***",
+    p < 0.01 ~ "**",
+    p < 0.05 ~ "*",
+    TRUE ~ "ns"
+  )
+}
+
+format_p <- function(p, adjusted = FALSE) {
+  prefix <- if (adjusted) "BH-adjusted P " else "P "
+
+  if (is.na(p)) {
+    return(paste0(prefix, "= NA"))
+  }
+
+  if (p < 0.001) {
+    return(paste0(prefix, "< 0.001"))
+  }
+
+  paste0(
+    prefix,
+    "= ",
+    formatC(p, digits = 3, format = "f")
+  )
+}
+
+safe_mean <- function(x) {
+  x <- x[is.finite(x)]
+  if (length(x) == 0) return(NA_real_)
+  mean(x)
+}
+
+safe_sd <- function(x) {
+  x <- x[is.finite(x)]
+  if (length(x) < 2) return(NA_real_)
+  stats::sd(x)
+}
+
+theme_publication <- ggplot2::theme_bw(base_size = 12) +
+  ggplot2::theme(
+    panel.grid.minor = ggplot2::element_blank(),
+    panel.grid.major.x = ggplot2::element_blank(),
+    panel.border = ggplot2::element_rect(
+      color = "grey25",
+      fill = NA,
+      linewidth = 0.8
+    ),
+    axis.text = ggplot2::element_text(color = "grey20"),
+    axis.title = ggplot2::element_text(color = "grey20"),
+    strip.background = ggplot2::element_rect(
+      fill = "grey92",
+      color = "grey25",
+      linewidth = 0.8
+    ),
+    strip.text = ggplot2::element_text(
+      face = "bold",
+      color = "grey15"
+    ),
+    plot.title = ggplot2::element_text(
+      hjust = 0.5,
+      face = "bold"
+    ),
+    plot.subtitle = ggplot2::element_text(
+      hjust = 0.5,
+      color = "grey30"
+    )
+  )
+
+
+# ==============================================================================
+# 5. FILE DISCOVERY AND METADATA
+# ==============================================================================
+
+parse_input_file <- function(path, marker) {
+  file_name <- tools::file_path_sans_ext(basename(path))
+  article_number <- stringr::str_extract(
+    file_name,
+    "(?<=文章)\\d+"
+  )
+
+  tibble::tibble(
+    FilePath = path,
+    FileName = file_name,
+    Study = ifelse(
+      is.na(article_number),
+      NA_character_,
+      paste0("R", article_number)
+    ),
+    StudyNumber = suppressWarnings(as.numeric(article_number)),
+    Status = dplyr::case_when(
+      stringr::str_detect(
+        file_name,
+        paste0("^I", marker, "-文章\\d+$")
+      ) ~ "Invasive",
+      stringr::str_detect(
+        file_name,
+        paste0("^N", marker, "-文章\\d+$")
+      ) ~ "Native",
+      TRUE ~ NA_character_
+    )
+  )
+}
+
+infer_plant_group <- function(sample_id) {
+  terminal_replicate_pattern <- stringr::regex(
+    "([._-]?(rep|sample|s))?[._-]?\\d+$",
+    ignore_case = TRUE
+  )
+
+  parsed <- stringr::str_replace(
+    as.character(sample_id),
+    terminal_replicate_pattern,
+    ""
+  )
+
+  parsed <- stringr::str_replace(
+    parsed,
+    "[._-]+$",
+    ""
+  )
+
+  invalid <- is.na(parsed) | parsed == ""
+  parsed[invalid] <- as.character(sample_id)[invalid]
+
+  parsed
+}
+
+read_manual_metadata <- function(path) {
+  if (!file.exists(path)) {
+    return(NULL)
+  }
+
+  sheets <- readxl::excel_sheets(path)
+
+  if (!"metadata" %in% sheets) {
+    stop(
+      "Manual metadata file exists, but sheet 'metadata' is missing: ",
+      path
+    )
+  }
+
+  metadata <- readxl::read_excel(
+    path,
+    sheet = "metadata"
+  ) |>
+    as.data.frame()
+
+  required_columns <- c(
+    "Study",
+    "SampleID",
+    "Status",
+    "PlantGroup"
+  )
+
+  missing_columns <- setdiff(
+    required_columns,
+    colnames(metadata)
+  )
+
+  if (length(missing_columns) > 0) {
+    stop(
+      "Manual metadata is missing columns: ",
+      paste(missing_columns, collapse = ", ")
+    )
+  }
+
+  metadata |>
+    transmute(
+      Study = as.character(Study),
+      SampleID = as.character(SampleID),
+      ManualStatus = as.character(Status),
+      ManualPlantGroup = as.character(PlantGroup)
+    ) |>
+    distinct()
+}
+
+manual_metadata <- read_manual_metadata(
+  MANUAL_METADATA_FILE
+)
+
+file_pattern <- paste0(
+  "^[IN]",
+  MARKER,
+  "-文章\\d+\\.xlsx$"
+)
 
 input_files <- list.files(
-  path = workdir,
-  pattern = "\\.xlsx$",
+  INPUT_DIR,
+  pattern = file_pattern,
   full.names = TRUE
 )
 
-input_files <- input_files[!grepl("^~\\$", basename(input_files))]
+input_files <- input_files[
+  !grepl("^~\\$", basename(input_files))
+]
 
-if (length(input_files) == 0) {
-  stop("No .xlsx files were found in the working directory.")
-}
-
-out_dir <- file.path(workdir, output_dir_name)
-if (!dir.exists(out_dir)) {
-  dir.create(out_dir, recursive = TRUE)
-}
-
-
-## File-name parser -----------------------------------------------------------
-
-parse_file_info <- function(file_path) {
-  file_name <- tools::file_path_sans_ext(basename(file_path))
-
-  habitat_type <- case_when(
-    str_detect(file_name, "^I") ~ "Invasive",
-    str_detect(file_name, "^N") ~ "Native",
-    str_detect(file_name, "Invasive") ~ "Invasive",
-    str_detect(file_name, "Native") ~ "Native",
-    str_detect(file_name, "Invasive") ~ "Invasive",
-    str_detect(file_name, "Native") ~ "Native",
-    TRUE ~ NA_character_
+file_info <- purrr::map_dfr(
+  input_files,
+  parse_input_file,
+  marker = MARKER
+) |>
+  filter(
+    !is.na(Study),
+    !is.na(Status)
   )
 
-  article_id <- str_extract(file_name, "Article\\d+|文章\\d+")
+study_pairs <- file_info |>
+  select(
+    Study,
+    StudyNumber,
+    Status,
+    FilePath
+  ) |>
+  tidyr::pivot_wider(
+    names_from = Status,
+    values_from = FilePath
+  ) |>
+  arrange(StudyNumber)
 
-  if (!is.na(article_id)) {
-    article_num <- str_extract(article_id, "\\d+")
-    article_id <- paste0("Article", article_num)
-  }
+missing_pairs <- study_pairs |>
+  filter(
+    is.na(Invasive) |
+      is.na(Native)
+  )
 
-  data.frame(
-    FilePath = file_path,
-    FileName = file_name,
-    HabitatType = habitat_type,
-    ArticleID = article_id,
-    stringsAsFactors = FALSE
+if (nrow(missing_pairs) > 0) {
+  openxlsx::write.xlsx(
+    missing_pairs,
+    file.path(TABLE_DIR, "missing_study_pairs.xlsx"),
+    overwrite = TRUE
   )
 }
 
-file_info <- bind_rows(lapply(input_files, parse_file_info)) %>%
-  filter(!is.na(HabitatType), !is.na(ArticleID))
+study_pairs <- study_pairs |>
+  filter(
+    !is.na(Invasive),
+    !is.na(Native)
+  )
 
-if (nrow(file_info) == 0) {
+if (nrow(study_pairs) == 0) {
   stop(
-    "No valid paired files were detected. Expected names such as ",
-    "I16S-Article1.xlsx / N16S-Article1.xlsx or ",
-    "I16S-文章1.xlsx / N16S-文章1.xlsx."
+    "No complete invasive/native file pairs were found in: ",
+    INPUT_DIR
   )
 }
 
 
-## Utility functions ----------------------------------------------------------
+# ==============================================================================
+# 6. OTU/ASV TABLE READING
+# ==============================================================================
 
-read_otu_excel <- function(file) {
-  dat <- readxl::read_excel(file)
-  dat <- as.data.frame(dat, check.names = FALSE)
+read_otu_table <- function(path) {
+  dat <- readxl::read_excel(path) |>
+    as.data.frame(check.names = FALSE)
 
   if (ncol(dat) < 2) {
-    stop("The input file has too few columns to be an OTU table: ", basename(file))
+    stop("Too few columns in ", basename(path))
   }
 
-  colnames(dat)[1] <- "OTU_ID"
-  dat <- dat[, colSums(!is.na(dat)) > 0, drop = FALSE]
-  dat
-}
+  colnames(dat)[1] <- "FeatureID"
 
-
-split_otu_and_tax <- function(dat) {
-  col_names <- colnames(dat)
-
-  tax_keywords <- c(
-    "taxonomy", "tax", "kingdom", "phylum", "class",
-    "order", "family", "genus", "species"
+  taxonomy_columns <- c(
+    "taxonomy",
+    "tax",
+    "kingdom",
+    "phylum",
+    "class",
+    "order",
+    "family",
+    "genus",
+    "species"
   )
 
-  tax_idx <- which(tolower(col_names) %in% tax_keywords)
-  sample_candidates <- setdiff(seq_along(col_names), c(1, tax_idx))
-
-  is_numeric_sample <- sapply(dat[, sample_candidates, drop = FALSE], function(x) {
-    suppressWarnings({
-      x_num <- as.numeric(x)
-      mean(!is.na(x_num)) > 0.8
-    })
-  })
-
-  sample_idx <- sample_candidates[is_numeric_sample]
-
-  if (length(sample_idx) < 2) {
-    stop("Sample columns could not be detected: ", paste(col_names, collapse = ", "))
-  }
-
-  otu_df <- dat[, c(1, sample_idx), drop = FALSE]
-
-  for (j in 2:ncol(otu_df)) {
-    otu_df[[j]] <- suppressWarnings(as.numeric(otu_df[[j]]))
-  }
-
-  otu_df[is.na(otu_df)] <- 0
-  otu_df$OTU_ID <- make.unique(as.character(otu_df$OTU_ID))
-  otu_df
-}
-
-
-filter_otu_table <- function(otu_df, min_total_count = 5, min_prevalence = 2) {
-  otu_mat <- as.matrix(otu_df[, -1, drop = FALSE])
-  rownames(otu_mat) <- otu_df$OTU_ID
-
-  keep_total <- rowSums(otu_mat) >= min_total_count
-  keep_prev <- rowSums(otu_mat > 0) >= min_prevalence
-  keep <- keep_total & keep_prev
-
-  filtered_mat <- otu_mat[keep, , drop = FALSE]
-
-  if (nrow(filtered_mat) == 0) {
-    stop("No OTUs remained after filtering.")
-  }
-
-  filtered_mat
-}
-
-
-extract_plant_group <- function(sample_names) {
-  plant_group <- str_extract(sample_names, "^[A-Za-z]+")
-  plant_group[is.na(plant_group) | plant_group == ""] <-
-    sample_names[is.na(plant_group) | plant_group == ""]
-  plant_group
-}
-
-
-build_metadata <- function(sample_names, habitat_type, article_id, file_name) {
-  meta <- data.frame(
-    SampleID = sample_names,
-    PlantGroup = extract_plant_group(sample_names),
-    HabitatType = habitat_type,
-    ArticleID = article_id,
-    FileName = file_name,
-    stringsAsFactors = FALSE
-  )
-
-  rownames(meta) <- meta$SampleID
-  meta
-}
-
-
-calc_alpha_diversity <- function(otu_mat, meta) {
-  comm <- t(otu_mat)
-
-  alpha_df <- data.frame(
-    SampleID = rownames(comm),
-    Observed_OTUs = as.numeric(specnumber(comm)),
-    Shannon = as.numeric(diversity(comm, index = "shannon")),
-    Simpson = as.numeric(diversity(comm, index = "simpson")),
-    Chao1 = as.numeric(estimateR(comm)["S.chao1", ]),
-    stringsAsFactors = FALSE
-  ) %>%
-    left_join(meta, by = "SampleID")
-
-  alpha_df
-}
-
-
-calc_bray_curtis <- function(otu_mat) {
-  comm <- t(otu_mat)
-  bray_dist <- vegdist(comm, method = "bray")
-
-  list(
-    dist = bray_dist,
-    matrix = as.matrix(bray_dist)
-  )
-}
-
-
-calc_beta_sample_metrics <- function(bray_dist, bray_mat, meta) {
-  beta_disp <- betadisper(bray_dist, group = meta$HabitatType, type = "centroid")
-
-  centroid_df <- data.frame(
-    SampleID = names(beta_disp$distances),
-    Distance_to_centroid = as.numeric(beta_disp$distances),
-    stringsAsFactors = FALSE
-  )
-
-  sample_ids <- rownames(bray_mat)
-
-  same_plant_group_mean <- sapply(sample_ids, function(sample_id) {
-    plant_group <- meta[sample_id, "PlantGroup"]
-    same_ids <- meta$SampleID[
-      meta$PlantGroup == plant_group & meta$SampleID != sample_id
-    ]
-
-    if (length(same_ids) == 0) return(NA_real_)
-    mean(bray_mat[sample_id, same_ids], na.rm = TRUE)
-  })
-
-  same_habitat_mean <- sapply(sample_ids, function(sample_id) {
-    habitat <- meta[sample_id, "HabitatType"]
-    same_ids <- meta$SampleID[
-      meta$HabitatType == habitat & meta$SampleID != sample_id
-    ]
-
-    if (length(same_ids) == 0) return(NA_real_)
-    mean(bray_mat[sample_id, same_ids], na.rm = TRUE)
-  })
-
-  other_habitat_mean <- sapply(sample_ids, function(sample_id) {
-    habitat <- meta[sample_id, "HabitatType"]
-    other_ids <- meta$SampleID[meta$HabitatType != habitat]
-
-    if (length(other_ids) == 0) return(NA_real_)
-    mean(bray_mat[sample_id, other_ids], na.rm = TRUE)
-  })
-
-  data.frame(
-    SampleID = sample_ids,
-    MeanDist_to_same_PlantGroup = as.numeric(same_plant_group_mean),
-    MeanDist_to_same_Habitat = as.numeric(same_habitat_mean),
-    MeanDist_to_other_Habitat = as.numeric(other_habitat_mean),
-    stringsAsFactors = FALSE
-  ) %>%
-    left_join(centroid_df, by = "SampleID") %>%
-    left_join(meta, by = "SampleID")
-}
-
-
-calc_group_summary <- function(alpha_df, beta_sample_df) {
-  alpha_summary <- alpha_df %>%
-    group_by(ArticleID, HabitatType, PlantGroup) %>%
-    summarise(
-      n_samples = n(),
-      Mean_Observed_OTUs = mean(Observed_OTUs, na.rm = TRUE),
-      Mean_Shannon = mean(Shannon, na.rm = TRUE),
-      Mean_Simpson = mean(Simpson, na.rm = TRUE),
-      Mean_Chao1 = mean(Chao1, na.rm = TRUE),
-      .groups = "drop"
-    )
-
-  beta_summary <- beta_sample_df %>%
-    group_by(ArticleID, HabitatType, PlantGroup) %>%
-    summarise(
-      Mean_Distance_to_centroid = mean(Distance_to_centroid, na.rm = TRUE),
-      MeanDist_to_same_PlantGroup = mean(MeanDist_to_same_PlantGroup, na.rm = TRUE),
-      MeanDist_to_same_Habitat = mean(MeanDist_to_same_Habitat, na.rm = TRUE),
-      MeanDist_to_other_Habitat = mean(MeanDist_to_other_Habitat, na.rm = TRUE),
-      .groups = "drop"
-    )
-
-  left_join(
-    alpha_summary,
-    beta_summary,
-    by = c("ArticleID", "HabitatType", "PlantGroup")
-  )
-}
-
-
-calc_article_summary <- function(bray_dist, bray_mat, meta, article_id, perm_n = 999) {
-  if (length(unique(meta$HabitatType)) < 2) {
-    return(data.frame(
-      ArticleID = article_id,
-      PERMANOVA_F = NA_real_,
-      PERMANOVA_R2 = NA_real_,
-      PERMANOVA_P = NA_real_,
-      Invasive_mean_centroid_distance = NA_real_,
-      Native_mean_centroid_distance = NA_real_,
-      Delta_centroid_distance = NA_real_,
-      Invasive_mean_within_bray = NA_real_,
-      Native_mean_within_bray = NA_real_,
-      Delta_within_bray = NA_real_,
-      Mean_between_habitat_bray = NA_real_,
-      Note = "Only one habitat type; article-level comparison skipped.",
-      stringsAsFactors = FALSE
-    ))
-  }
-
-  adonis_res <- adonis2(bray_dist ~ HabitatType, data = meta, permutations = perm_n)
-  adonis_df <- as.data.frame(adonis_res)
-  adonis_df$Term <- rownames(adonis_df)
-  rownames(adonis_df) <- NULL
-  adonis_main <- adonis_df[adonis_df$Term == "HabitatType", , drop = FALSE]
-
-  beta_disp <- betadisper(bray_dist, group = meta$HabitatType, type = "centroid")
-
-  centroid_df <- data.frame(
-    SampleID = names(beta_disp$distances),
-    Distance_to_centroid = as.numeric(beta_disp$distances),
-    stringsAsFactors = FALSE
-  ) %>%
-    left_join(meta, by = "SampleID")
-
-  inv_centroid <- mean(
-    centroid_df$Distance_to_centroid[centroid_df$HabitatType == "Invasive"],
-    na.rm = TRUE
-  )
-
-  nat_centroid <- mean(
-    centroid_df$Distance_to_centroid[centroid_df$HabitatType == "Native"],
-    na.rm = TRUE
-  )
-
-  inv_ids <- meta$SampleID[meta$HabitatType == "Invasive"]
-  nat_ids <- meta$SampleID[meta$HabitatType == "Native"]
-
-  get_within_mean <- function(sample_ids, dist_mat) {
-    if (length(sample_ids) < 2) return(NA_real_)
-    sub_mat <- dist_mat[sample_ids, sample_ids, drop = FALSE]
-    mean(sub_mat[upper.tri(sub_mat)], na.rm = TRUE)
-  }
-
-  inv_within <- get_within_mean(inv_ids, bray_mat)
-  nat_within <- get_within_mean(nat_ids, bray_mat)
-
-  between_mean <- if (length(inv_ids) > 0 && length(nat_ids) > 0) {
-    mean(bray_mat[inv_ids, nat_ids], na.rm = TRUE)
-  } else {
-    NA_real_
-  }
-
-  p_col <- grep("Pr", colnames(adonis_main), value = TRUE)[1]
-
-  data.frame(
-    ArticleID = article_id,
-    PERMANOVA_F = adonis_main$F[1],
-    PERMANOVA_R2 = adonis_main$R2[1],
-    PERMANOVA_P = adonis_main[[p_col]][1],
-    Invasive_mean_centroid_distance = inv_centroid,
-    Native_mean_centroid_distance = nat_centroid,
-    Delta_centroid_distance = inv_centroid - nat_centroid,
-    Invasive_mean_within_bray = inv_within,
-    Native_mean_within_bray = nat_within,
-    Delta_within_bray = inv_within - nat_within,
-    Mean_between_habitat_bray = between_mean,
-    Note = NA_character_,
-    stringsAsFactors = FALSE
-  )
-}
-
-
-save_distance_matrix <- function(bray_mat, out_file) {
-  wb <- createWorkbook()
-  addWorksheet(wb, "BrayCurtis")
-  writeData(
-    wb,
-    "BrayCurtis",
-    data.frame(SampleID = rownames(bray_mat), bray_mat),
-    rowNames = FALSE
-  )
-  saveWorkbook(wb, out_file, overwrite = TRUE)
-}
-
-
-merge_paired_otu_tables <- function(invasive_file, native_file) {
-  invasive_raw <- read_otu_excel(invasive_file$FilePath)
-  native_raw <- read_otu_excel(native_file$FilePath)
-
-  invasive_otu <- split_otu_and_tax(invasive_raw)
-  native_otu <- split_otu_and_tax(native_raw)
-
-  invasive_df <- as.data.frame(invasive_otu, check.names = FALSE)
-  native_df <- as.data.frame(native_otu, check.names = FALSE)
-
-  merged_df <- full_join(invasive_df, native_df, by = "OTU_ID")
-  merged_df[is.na(merged_df)] <- 0
-
-  otu_mat <- filter_otu_table(
-    merged_df,
-    min_total_count = min_total_count,
-    min_prevalence = min_prevalence
-  )
-
-  invasive_meta <- build_metadata(
-    sample_names = colnames(invasive_df)[-1],
-    habitat_type = "Invasive",
-    article_id = invasive_file$ArticleID[1],
-    file_name = invasive_file$FileName[1]
-  )
-
-  native_meta <- build_metadata(
-    sample_names = colnames(native_df)[-1],
-    habitat_type = "Native",
-    article_id = native_file$ArticleID[1],
-    file_name = native_file$FileName[1]
-  )
-
-  meta <- bind_rows(invasive_meta, native_meta)
-  meta <- meta[colnames(otu_mat), , drop = FALSE]
-
-  list(
-    otu_mat = otu_mat,
-    meta = meta
-  )
-}
-
-
-## Process paired datasets ----------------------------------------------------
-
-article_ids <- sort(unique(file_info$ArticleID))
-
-all_alpha <- list()
-all_beta_sample <- list()
-all_group_summary <- list()
-all_article_summary <- list()
-all_metadata <- list()
-
-for (article_id in article_ids) {
-  message("Processing ", article_id, " ...")
-
-  article_dir <- file.path(out_dir, article_id)
-  if (!dir.exists(article_dir)) {
-    dir.create(article_dir, recursive = TRUE)
-  }
-
-  article_files <- file_info %>% filter(ArticleID == article_id)
-  invasive_file <- article_files %>% filter(HabitatType == "Invasive")
-  native_file <- article_files %>% filter(HabitatType == "Native")
-
-  if (nrow(invasive_file) == 0 || nrow(native_file) == 0) {
-    warning(article_id, " was skipped because the invasive or native file is missing.")
-    next
-  }
-
-  result <- tryCatch({
-    merged <- merge_paired_otu_tables(invasive_file, native_file)
-    otu_mat <- merged$otu_mat
-    meta <- merged$meta
-
-    alpha_df <- calc_alpha_diversity(otu_mat, meta)
-
-    bray_res <- calc_bray_curtis(otu_mat)
-    bray_dist <- bray_res$dist
-    bray_mat <- bray_res$matrix
-
-    beta_sample_df <- calc_beta_sample_metrics(bray_dist, bray_mat, meta)
-    group_summary_df <- calc_group_summary(alpha_df, beta_sample_df)
-    article_summary_df <- calc_article_summary(
-      bray_dist,
-      bray_mat,
-      meta,
-      article_id,
-      perm_n = perm_n
-    )
-
-    write.xlsx(
-      alpha_df,
-      file = file.path(article_dir, paste0(article_id, "_alpha_diversity.xlsx")),
-      rowNames = FALSE
-    )
-
-    write.xlsx(
-      beta_sample_df,
-      file = file.path(article_dir, paste0(article_id, "_beta_diversity.xlsx")),
-      rowNames = FALSE
-    )
-
-    write.xlsx(
-      group_summary_df,
-      file = file.path(article_dir, paste0(article_id, "_plant_group_summary.xlsx")),
-      rowNames = FALSE
-    )
-
-    write.xlsx(
-      article_summary_df,
-      file = file.path(article_dir, paste0(article_id, "_permanova_summary.xlsx")),
-      rowNames = FALSE
-    )
-
-    write.xlsx(
-      meta,
-      file = file.path(article_dir, paste0(article_id, "_metadata.xlsx")),
-      rowNames = FALSE
-    )
-
-    save_distance_matrix(
-      bray_mat,
-      out_file = file.path(article_dir, paste0(article_id, "_bray_curtis_matrix.xlsx"))
-    )
-
-    list(
-      alpha = alpha_df,
-      beta_sample = beta_sample_df,
-      group_summary = group_summary_df,
-      article_summary = article_summary_df,
-      metadata = meta
-    )
-  }, error = function(e) {
-    message("ERROR in ", article_id, ": ", e$message)
-
-    list(
-      alpha = data.frame(
-        ArticleID = article_id,
-        SampleID = NA_character_,
-        Observed_OTUs = NA_real_,
-        Shannon = NA_real_,
-        Simpson = NA_real_,
-        Chao1 = NA_real_,
-        PlantGroup = NA_character_,
-        HabitatType = NA_character_,
-        FileName = NA_character_,
-        Note = paste("ERROR:", e$message),
-        stringsAsFactors = FALSE
-      ),
-      beta_sample = data.frame(
-        ArticleID = article_id,
-        SampleID = NA_character_,
-        Distance_to_centroid = NA_real_,
-        MeanDist_to_same_PlantGroup = NA_real_,
-        MeanDist_to_same_Habitat = NA_real_,
-        MeanDist_to_other_Habitat = NA_real_,
-        PlantGroup = NA_character_,
-        HabitatType = NA_character_,
-        Note = paste("ERROR:", e$message),
-        stringsAsFactors = FALSE
-      ),
-      group_summary = data.frame(
-        ArticleID = article_id,
-        PlantGroup = NA_character_,
-        HabitatType = NA_character_,
-        Note = paste("ERROR:", e$message),
-        stringsAsFactors = FALSE
-      ),
-      article_summary = data.frame(
-        ArticleID = article_id,
-        PERMANOVA_F = NA_real_,
-        PERMANOVA_R2 = NA_real_,
-        PERMANOVA_P = NA_real_,
-        Invasive_mean_centroid_distance = NA_real_,
-        Native_mean_centroid_distance = NA_real_,
-        Delta_centroid_distance = NA_real_,
-        Invasive_mean_within_bray = NA_real_,
-        Native_mean_within_bray = NA_real_,
-        Delta_within_bray = NA_real_,
-        Mean_between_habitat_bray = NA_real_,
-        Note = paste("ERROR:", e$message),
-        stringsAsFactors = FALSE
-      ),
-      metadata = data.frame(
-        ArticleID = article_id,
-        SampleID = NA_character_,
-        PlantGroup = NA_character_,
-        HabitatType = NA_character_,
-        Note = paste("ERROR:", e$message),
-        stringsAsFactors = FALSE
+  candidate_columns <- setdiff(
+    seq_along(dat),
+    c(
+      1,
+      which(
+        tolower(colnames(dat)) %in%
+          taxonomy_columns
       )
     )
-  })
+  )
 
-  all_alpha[[length(all_alpha) + 1]] <- result$alpha
-  all_beta_sample[[length(all_beta_sample) + 1]] <- result$beta_sample
-  all_group_summary[[length(all_group_summary) + 1]] <- result$group_summary
-  all_article_summary[[length(all_article_summary) + 1]] <- result$article_summary
-  all_metadata[[length(all_metadata) + 1]] <- result$metadata
+  numeric_sample_columns <- vapply(
+    dat[, candidate_columns, drop = FALSE],
+    function(x) {
+      converted <- suppressWarnings(as.numeric(x))
+      mean(!is.na(converted)) >= 0.80
+    },
+    FUN.VALUE = logical(1)
+  )
+
+  sample_columns <- candidate_columns[
+    numeric_sample_columns
+  ]
+
+  if (length(sample_columns) < 2) {
+    stop(
+      "Could not identify at least two numeric sample columns in ",
+      basename(path)
+    )
+  }
+
+  otu <- dat[, c(1, sample_columns), drop = FALSE]
+  otu$FeatureID <- as.character(otu$FeatureID)
+
+  for (j in 2:ncol(otu)) {
+    otu[[j]] <- suppressWarnings(as.numeric(otu[[j]]))
+  }
+
+  otu[is.na(otu)] <- 0
+
+  sample_names <- colnames(otu)[-1]
+
+  otu |>
+    group_by(FeatureID) |>
+    summarise(
+      across(
+        all_of(sample_names),
+        ~ sum(.x, na.rm = TRUE)
+      ),
+      .groups = "drop"
+    )
+}
+
+merge_study_tables <- function(
+  invasive_file,
+  native_file,
+  study
+) {
+  invasive_otu <- read_otu_table(invasive_file)
+  native_otu <- read_otu_table(native_file)
+
+  invasive_samples <- colnames(invasive_otu)[-1]
+  native_samples <- colnames(native_otu)[-1]
+
+  duplicated_samples <- intersect(
+    invasive_samples,
+    native_samples
+  )
+
+  if (length(duplicated_samples) > 0) {
+    stop(
+      study,
+      ": sample names occur in both invasive and native tables: ",
+      paste(duplicated_samples, collapse = ", ")
+    )
+  }
+
+  merged <- dplyr::full_join(
+    invasive_otu,
+    native_otu,
+    by = "FeatureID"
+  )
+
+  merged[is.na(merged)] <- 0
+
+  count_matrix <- as.matrix(
+    merged[, -1, drop = FALSE]
+  )
+
+  storage.mode(count_matrix) <- "numeric"
+  rownames(count_matrix) <- merged$FeatureID
+
+  count_matrix <- count_matrix[
+    rowSums(count_matrix) > 0,
+    ,
+    drop = FALSE
+  ]
+
+  metadata <- tibble::tibble(
+    Study = study,
+    SampleID = c(
+      invasive_samples,
+      native_samples
+    ),
+    Status = c(
+      rep("Invasive", length(invasive_samples)),
+      rep("Native", length(native_samples))
+    ),
+    AutoPlantGroup = infer_plant_group(
+      c(invasive_samples, native_samples)
+    )
+  )
+
+  if (!is.null(manual_metadata)) {
+    metadata <- metadata |>
+      left_join(
+        manual_metadata,
+        by = c("Study", "SampleID")
+      ) |>
+      mutate(
+        PlantGroup_raw = ifelse(
+          !is.na(ManualPlantGroup) &
+            ManualPlantGroup != "",
+          ManualPlantGroup,
+          AutoPlantGroup
+        )
+      )
+
+    status_mismatch <- metadata |>
+      filter(
+        !is.na(ManualStatus),
+        ManualStatus != Status
+      )
+
+    if (nrow(status_mismatch) > 0) {
+      stop(
+        study,
+        ": manual Status disagrees with file prefix."
+      )
+    }
+  } else {
+    metadata <- metadata |>
+      mutate(
+        PlantGroup_raw = AutoPlantGroup
+      )
+  }
+
+  metadata <- metadata |>
+    mutate(
+      Status = factor(
+        Status,
+        levels = c("Native", "Invasive")
+      ),
+      PlantGroup = paste(
+        Study,
+        PlantGroup_raw,
+        sep = "__"
+      )
+    )
+
+  sample_match <- match(
+    colnames(count_matrix),
+    metadata$SampleID
+  )
+
+  if (anyNA(sample_match)) {
+    stop(
+      study,
+      ": failed to match matrix samples to metadata."
+    )
+  }
+
+  metadata <- metadata[
+    sample_match,
+    ,
+    drop = FALSE
+  ]
+
+  list(
+    count_matrix = count_matrix,
+    metadata = metadata
+  )
 }
 
 
-## Combine and export results -------------------------------------------------
+# ==============================================================================
+# 7. ALPHA-DIVERSITY FUNCTIONS
+# ==============================================================================
 
-alpha_all_df <- bind_rows(all_alpha)
-beta_sample_all_df <- bind_rows(all_beta_sample)
-group_summary_all_df <- bind_rows(all_group_summary)
-article_summary_all_df <- bind_rows(all_article_summary)
-metadata_all_df <- bind_rows(all_metadata)
+prepare_alpha_matrix <- function(
+  count_matrix,
+  metadata
+) {
+  library_size <- colSums(count_matrix)
 
-summary_file <- file.path(out_dir, "community_analysis_summary.xlsx")
+  depth_table <- metadata |>
+    mutate(
+      LibrarySize = as.numeric(
+        library_size[SampleID]
+      ),
+      RetainedForAlpha =
+        LibrarySize >= MIN_LIBRARY_SIZE
+    )
 
-wb <- createWorkbook()
+  alpha_matrix <- count_matrix
+  rarefaction_depth <- NA_real_
 
-addWorksheet(wb, "Alpha_sample_all")
-writeData(wb, "Alpha_sample_all", alpha_all_df)
+  if (RAREFY_ALPHA) {
+    retained_samples <- depth_table |>
+      filter(RetainedForAlpha) |>
+      pull(SampleID)
 
-addWorksheet(wb, "Beta_sample_all")
-writeData(wb, "Beta_sample_all", beta_sample_all_df)
+    alpha_matrix <- alpha_matrix[
+      ,
+      retained_samples,
+      drop = FALSE
+    ]
 
-addWorksheet(wb, "PlantGroup_summary_all")
-writeData(wb, "PlantGroup_summary_all", group_summary_all_df)
+    rarefaction_depth <- min(
+      colSums(alpha_matrix)
+    )
 
-addWorksheet(wb, "Article_summary_all")
-writeData(wb, "Article_summary_all", article_summary_all_df)
+    alpha_matrix <- t(
+      vegan::rrarefy(
+        t(alpha_matrix),
+        sample = rarefaction_depth
+      )
+    )
+  }
 
-addWorksheet(wb, "Metadata_all")
-writeData(wb, "Metadata_all", metadata_all_df)
+  list(
+    alpha_matrix = alpha_matrix,
+    depth_table = depth_table,
+    rarefaction_depth = rarefaction_depth
+  )
+}
 
-saveWorkbook(wb, summary_file, overwrite = TRUE)
+calculate_alpha <- function(
+  alpha_matrix,
+  metadata
+) {
+  community <- t(alpha_matrix)
 
-run_summary <- data.frame(
-  Total_input_files = length(input_files),
-  Total_valid_articles = length(article_ids),
-  Total_alpha_rows = nrow(alpha_all_df),
-  Total_beta_sample_rows = nrow(beta_sample_all_df),
-  Total_group_summary_rows = nrow(group_summary_all_df),
-  Total_article_summary_rows = nrow(article_summary_all_df),
-  stringsAsFactors = FALSE
+  tibble::tibble(
+    SampleID = rownames(community),
+    Richness = as.numeric(
+      vegan::specnumber(community)
+    ),
+    Chao1 = as.numeric(
+      vegan::estimateR(community)["S.chao1", ]
+    ),
+    Shannon = as.numeric(
+      vegan::diversity(
+        community,
+        index = "shannon"
+      )
+    ),
+    Simpson = as.numeric(
+      vegan::diversity(
+        community,
+        index = "simpson"
+      )
+    )
+  ) |>
+    left_join(
+      metadata,
+      by = "SampleID"
+    )
+}
+
+calculate_hedges_g <- function(
+  invasive_values,
+  native_values
+) {
+  invasive_values <- invasive_values[
+    is.finite(invasive_values)
+  ]
+
+  native_values <- native_values[
+    is.finite(native_values)
+  ]
+
+  n_invasive <- length(invasive_values)
+  n_native <- length(native_values)
+
+  if (
+    n_invasive < 2 ||
+      n_native < 2
+  ) {
+    return(
+      tibble::tibble(
+        n_Invasive_PlantGroups = n_invasive,
+        n_Native_PlantGroups = n_native,
+        mean_Invasive = safe_mean(invasive_values),
+        mean_Native = safe_mean(native_values),
+        Delta = NA_real_,
+        Hedges_g = NA_real_,
+        var_g = NA_real_,
+        ci_low = NA_real_,
+        ci_high = NA_real_
+      )
+    )
+  }
+
+  mean_invasive <- mean(invasive_values)
+  mean_native <- mean(native_values)
+  sd_invasive <- stats::sd(invasive_values)
+  sd_native <- stats::sd(native_values)
+
+  pooled_sd <- sqrt(
+    (
+      (n_invasive - 1) * sd_invasive^2 +
+        (n_native - 1) * sd_native^2
+    ) /
+      (
+        n_invasive +
+          n_native -
+          2
+      )
+  )
+
+  if (
+    !is.finite(pooled_sd) ||
+      pooled_sd <= 0
+  ) {
+    return(
+      tibble::tibble(
+        n_Invasive_PlantGroups = n_invasive,
+        n_Native_PlantGroups = n_native,
+        mean_Invasive = mean_invasive,
+        mean_Native = mean_native,
+        Delta = mean_invasive - mean_native,
+        Hedges_g = NA_real_,
+        var_g = NA_real_,
+        ci_low = NA_real_,
+        ci_high = NA_real_
+      )
+    )
+  }
+
+  cohen_d <- (
+    mean_invasive -
+      mean_native
+  ) / pooled_sd
+
+  correction_j <- 1 -
+    3 /
+      (
+        4 *
+          (
+            n_invasive +
+              n_native
+          ) -
+          9
+      )
+
+  hedges_g <- correction_j * cohen_d
+
+  variance_g <- (
+    n_invasive +
+      n_native
+  ) /
+    (
+      n_invasive *
+        n_native
+    ) +
+    hedges_g^2 /
+      (
+        2 *
+          (
+            n_invasive +
+              n_native -
+              2
+          )
+      )
+
+  standard_error <- sqrt(variance_g)
+
+  tibble::tibble(
+    n_Invasive_PlantGroups = n_invasive,
+    n_Native_PlantGroups = n_native,
+    mean_Invasive = mean_invasive,
+    mean_Native = mean_native,
+    Delta = mean_invasive - mean_native,
+    Hedges_g = hedges_g,
+    var_g = variance_g,
+    ci_low = hedges_g - 1.96 * standard_error,
+    ci_high = hedges_g + 1.96 * standard_error
+  )
+}
+
+
+# ==============================================================================
+# 8. BETA-DIVERSITY FUNCTIONS
+# ==============================================================================
+
+prepare_beta_relative_abundance <- function(
+  count_matrix
+) {
+  keep_feature <- (
+    rowSums(count_matrix) >=
+      BETA_MIN_TOTAL_COUNT &
+      rowSums(count_matrix > 0) >=
+        BETA_MIN_PREVALENCE
+  )
+
+  filtered_matrix <- count_matrix[
+    keep_feature,
+    ,
+    drop = FALSE
+  ]
+
+  if (nrow(filtered_matrix) == 0) {
+    stop(
+      "No features remained after beta-diversity filtering."
+    )
+  }
+
+  sample_by_feature <- t(filtered_matrix)
+
+  if (any(rowSums(sample_by_feature) == 0)) {
+    stop(
+      "At least one sample has zero abundance after filtering."
+    )
+  }
+
+  vegan::decostand(
+    sample_by_feature,
+    method = "total"
+  )
+}
+
+calculate_plantgroup_centroids <- function(
+  relative_abundance,
+  metadata
+) {
+  community_data <- as.data.frame(
+    relative_abundance,
+    check.names = FALSE
+  ) |>
+    tibble::rownames_to_column(
+      "SampleID"
+    ) |>
+    left_join(
+      metadata,
+      by = "SampleID"
+    )
+
+  feature_columns <- setdiff(
+    colnames(community_data),
+    c(
+      "SampleID",
+      "Study",
+      "Status",
+      "AutoPlantGroup",
+      "PlantGroup_raw",
+      "PlantGroup",
+      "ManualStatus",
+      "ManualPlantGroup"
+    )
+  )
+
+  centroid_data <- community_data |>
+    group_by(
+      Study,
+      Status,
+      PlantGroup,
+      PlantGroup_raw
+    ) |>
+    summarise(
+      across(
+        all_of(feature_columns),
+        ~ mean(.x, na.rm = TRUE)
+      ),
+      n_samples = n(),
+      .groups = "drop"
+    )
+
+  centroid_matrix <- centroid_data |>
+    select(
+      all_of(feature_columns)
+    ) |>
+    as.matrix()
+
+  storage.mode(centroid_matrix) <- "numeric"
+  rownames(centroid_matrix) <- centroid_data$PlantGroup
+
+  list(
+    centroid_matrix = centroid_matrix,
+    centroid_metadata = centroid_data |>
+      select(
+        Study,
+        Status,
+        PlantGroup,
+        PlantGroup_raw,
+        n_samples
+      ),
+    centroid_data = centroid_data
+  )
+}
+
+calculate_delta_bray <- function(
+  centroid_matrix,
+  status_vector
+) {
+  status_vector <- as.character(status_vector)
+
+  invasive_index <- which(
+    status_vector == "Invasive"
+  )
+
+  native_index <- which(
+    status_vector == "Native"
+  )
+
+  if (
+    length(invasive_index) < 2 ||
+      length(native_index) < 2
+  ) {
+    return(
+      tibble::tibble(
+        MeanBetween = NA_real_,
+        MeanWithinInvasive = NA_real_,
+        MeanWithinNative = NA_real_,
+        MeanWithinAverage = NA_real_,
+        Delta_BrayCurtis = NA_real_
+      )
+    )
+  }
+
+  bray_matrix <- as.matrix(
+    vegan::vegdist(
+      centroid_matrix,
+      method = "bray"
+    )
+  )
+
+  invasive_within <- bray_matrix[
+    invasive_index,
+    invasive_index,
+    drop = FALSE
+  ]
+
+  native_within <- bray_matrix[
+    native_index,
+    native_index,
+    drop = FALSE
+  ]
+
+  between <- bray_matrix[
+    invasive_index,
+    native_index,
+    drop = FALSE
+  ]
+
+  mean_within_invasive <- mean(
+    invasive_within[
+      upper.tri(invasive_within)
+    ],
+    na.rm = TRUE
+  )
+
+  mean_within_native <- mean(
+    native_within[
+      upper.tri(native_within)
+    ],
+    na.rm = TRUE
+  )
+
+  mean_between <- mean(
+    between,
+    na.rm = TRUE
+  )
+
+  mean_within_average <- mean(
+    c(
+      mean_within_invasive,
+      mean_within_native
+    )
+  )
+
+  tibble::tibble(
+    MeanBetween = mean_between,
+    MeanWithinInvasive = mean_within_invasive,
+    MeanWithinNative = mean_within_native,
+    MeanWithinAverage = mean_within_average,
+    Delta_BrayCurtis =
+      mean_between -
+      mean_within_average
+  )
+}
+
+bootstrap_delta_bray <- function(
+  centroid_matrix,
+  status_vector,
+  n_boot = 999
+) {
+  status_vector <- as.character(status_vector)
+
+  invasive_index <- which(
+    status_vector == "Invasive"
+  )
+
+  native_index <- which(
+    status_vector == "Native"
+  )
+
+  if (
+    length(invasive_index) < 2 ||
+      length(native_index) < 2
+  ) {
+    return(
+      list(
+        values = numeric(0),
+        SE = NA_real_,
+        CI_low = NA_real_,
+        CI_high = NA_real_
+      )
+    )
+  }
+
+  bootstrap_values <- replicate(
+    n_boot,
+    {
+      sampled_invasive <- sample(
+        invasive_index,
+        size = length(invasive_index),
+        replace = TRUE
+      )
+
+      sampled_native <- sample(
+        native_index,
+        size = length(native_index),
+        replace = TRUE
+      )
+
+      bootstrap_matrix <- rbind(
+        centroid_matrix[
+          sampled_invasive,
+          ,
+          drop = FALSE
+        ],
+        centroid_matrix[
+          sampled_native,
+          ,
+          drop = FALSE
+        ]
+      )
+
+      bootstrap_status <- c(
+        rep("Invasive", length(sampled_invasive)),
+        rep("Native", length(sampled_native))
+      )
+
+      calculate_delta_bray(
+        bootstrap_matrix,
+        bootstrap_status
+      )$Delta_BrayCurtis
+    }
+  )
+
+  bootstrap_values <- bootstrap_values[
+    is.finite(bootstrap_values)
+  ]
+
+  if (length(bootstrap_values) < 20) {
+    return(
+      list(
+        values = bootstrap_values,
+        SE = NA_real_,
+        CI_low = NA_real_,
+        CI_high = NA_real_
+      )
+    )
+  }
+
+  list(
+    values = bootstrap_values,
+    SE = stats::sd(bootstrap_values),
+    CI_low = unname(
+      stats::quantile(
+        bootstrap_values,
+        probs = 0.025,
+        na.rm = TRUE,
+        type = 7
+      )
+    ),
+    CI_high = unname(
+      stats::quantile(
+        bootstrap_values,
+        probs = 0.975,
+        na.rm = TRUE,
+        type = 7
+      )
+    )
+  )
+}
+
+permutation_delta_bray_p <- function(
+  centroid_matrix,
+  status_vector,
+  observed_delta,
+  n_perm = 999
+) {
+  if (!is.finite(observed_delta)) {
+    return(NA_real_)
+  }
+
+  status_vector <- as.character(status_vector)
+
+  permutation_values <- replicate(
+    n_perm,
+    {
+      permuted_status <- sample(
+        status_vector,
+        replace = FALSE
+      )
+
+      calculate_delta_bray(
+        centroid_matrix,
+        permuted_status
+      )$Delta_BrayCurtis
+    }
+  )
+
+  permutation_values <- permutation_values[
+    is.finite(permutation_values)
+  ]
+
+  if (length(permutation_values) == 0) {
+    return(NA_real_)
+  }
+
+  (
+    sum(
+      abs(permutation_values) >=
+        abs(observed_delta)
+    ) + 1
+  ) /
+    (
+      length(permutation_values) + 1
+    )
+}
+
+calculate_permanova <- function(
+  centroid_matrix,
+  centroid_metadata
+) {
+  n_invasive <- sum(
+    centroid_metadata$Status == "Invasive"
+  )
+
+  n_native <- sum(
+    centroid_metadata$Status == "Native"
+  )
+
+  if (
+    n_invasive < 2 ||
+      n_native < 2
+  ) {
+    return(
+      tibble::tibble(
+        PERMANOVA_F = NA_real_,
+        PERMANOVA_R2 = NA_real_,
+        PERMANOVA_P = NA_real_
+      )
+    )
+  }
+
+  bray_distance <- vegan::vegdist(
+    centroid_matrix,
+    method = "bray"
+  )
+
+  result <- try(
+    vegan::adonis2(
+      bray_distance ~ Status,
+      data = centroid_metadata,
+      permutations = N_PERM
+    ),
+    silent = TRUE
+  )
+
+  if (inherits(result, "try-error")) {
+    return(
+      tibble::tibble(
+        PERMANOVA_F = NA_real_,
+        PERMANOVA_R2 = NA_real_,
+        PERMANOVA_P = NA_real_
+      )
+    )
+  }
+
+  p_column <- grep(
+    "^Pr",
+    colnames(result),
+    value = TRUE
+  )[1]
+
+  tibble::tibble(
+    PERMANOVA_F = as.numeric(
+      result["Status", "F"]
+    ),
+    PERMANOVA_R2 = as.numeric(
+      result["Status", "R2"]
+    ),
+    PERMANOVA_P = as.numeric(
+      result["Status", p_column]
+    )
+  )
+}
+
+calculate_beta_dispersion <- function(
+  centroid_matrix,
+  centroid_metadata
+) {
+  n_invasive <- sum(
+    centroid_metadata$Status == "Invasive"
+  )
+
+  n_native <- sum(
+    centroid_metadata$Status == "Native"
+  )
+
+  if (
+    n_invasive < 2 ||
+      n_native < 2
+  ) {
+    return(
+      list(
+        values = tibble::tibble(),
+        summary = tibble::tibble(
+          Dispersion_Invasive = NA_real_,
+          Dispersion_Native = NA_real_,
+          Delta_Dispersion = NA_real_,
+          PERMDISP_F = NA_real_,
+          PERMDISP_P = NA_real_
+        )
+      )
+    )
+  }
+
+  bray_distance <- vegan::vegdist(
+    centroid_matrix,
+    method = "bray"
+  )
+
+  dispersion <- vegan::betadisper(
+    bray_distance,
+    group = factor(
+      centroid_metadata$Status,
+      levels = c("Native", "Invasive")
+    ),
+    type = "centroid",
+    bias.adjust = TRUE
+  )
+
+  dispersion_values <- tibble::tibble(
+    PlantGroup = names(dispersion$distances),
+    DistanceToStatusCentroid = as.numeric(
+      dispersion$distances
+    )
+  ) |>
+    left_join(
+      centroid_metadata,
+      by = "PlantGroup"
+    )
+
+  dispersion_invasive <- mean(
+    dispersion_values$DistanceToStatusCentroid[
+      dispersion_values$Status == "Invasive"
+    ],
+    na.rm = TRUE
+  )
+
+  dispersion_native <- mean(
+    dispersion_values$DistanceToStatusCentroid[
+      dispersion_values$Status == "Native"
+    ],
+    na.rm = TRUE
+  )
+
+  permdisp <- try(
+    vegan::permutest(
+      dispersion,
+      permutations = N_PERM
+    ),
+    silent = TRUE
+  )
+
+  permdisp_f <- NA_real_
+  permdisp_p <- NA_real_
+
+  if (!inherits(permdisp, "try-error")) {
+    permdisp_table <- as.data.frame(permdisp$tab)
+    p_column <- grep(
+      "^Pr",
+      colnames(permdisp_table),
+      value = TRUE
+    )[1]
+
+    permdisp_f <- as.numeric(
+      permdisp_table[1, "F"]
+    )
+
+    permdisp_p <- as.numeric(
+      permdisp_table[1, p_column]
+    )
+  }
+
+  list(
+    values = dispersion_values,
+    summary = tibble::tibble(
+      Dispersion_Invasive = dispersion_invasive,
+      Dispersion_Native = dispersion_native,
+      Delta_Dispersion =
+        dispersion_invasive -
+        dispersion_native,
+      PERMDISP_F = permdisp_f,
+      PERMDISP_P = permdisp_p
+    )
+  )
+}
+
+calculate_pcoa <- function(
+  centroid_matrix,
+  centroid_metadata,
+  study
+) {
+  if (nrow(centroid_matrix) < 3) {
+    return(tibble::tibble())
+  }
+
+  bray_distance <- vegan::vegdist(
+    centroid_matrix,
+    method = "bray"
+  )
+
+  pcoa <- try(
+    stats::cmdscale(
+      bray_distance,
+      k = min(
+        2,
+        nrow(centroid_matrix) - 1
+      ),
+      eig = TRUE,
+      add = TRUE
+    ),
+    silent = TRUE
+  )
+
+  if (inherits(pcoa, "try-error")) {
+    return(tibble::tibble())
+  }
+
+  coordinates <- as.matrix(pcoa$points)
+
+  if (ncol(coordinates) == 1) {
+    coordinates <- cbind(
+      coordinates,
+      PCoA2 = 0
+    )
+  }
+
+  positive_eigenvalues <- pcoa$eig[
+    pcoa$eig > 0
+  ]
+
+  axis_1_percent <- ifelse(
+    length(positive_eigenvalues) >= 1,
+    positive_eigenvalues[1] /
+      sum(positive_eigenvalues) * 100,
+    NA_real_
+  )
+
+  axis_2_percent <- ifelse(
+    length(positive_eigenvalues) >= 2,
+    positive_eigenvalues[2] /
+      sum(positive_eigenvalues) * 100,
+    NA_real_
+  )
+
+  tibble::tibble(
+    PlantGroup = rownames(coordinates),
+    PCoA1 = coordinates[, 1],
+    PCoA2 = coordinates[, 2],
+    PCoA1_percent = axis_1_percent,
+    PCoA2_percent = axis_2_percent,
+    Study = study
+  ) |>
+    left_join(
+      centroid_metadata,
+      by = c("Study", "PlantGroup")
+    )
+}
+
+
+# ==============================================================================
+# 9. PROCESS EACH STUDY
+# ==============================================================================
+
+alpha_sample_list <- list()
+alpha_group_list <- list()
+alpha_effect_list <- list()
+metadata_list <- list()
+depth_list <- list()
+
+beta_summary_list <- list()
+dispersion_value_list <- list()
+pcoa_list <- list()
+centroid_data_list <- list()
+bootstrap_delta_list <- list()
+
+run_log_list <- list()
+
+for (study_index in seq_len(nrow(study_pairs))) {
+  current_study <- study_pairs$Study[study_index]
+
+  message(
+    "Processing ",
+    MARKER,
+    " study ",
+    current_study,
+    "..."
+  )
+
+  result <- tryCatch(
+    {
+      merged <- merge_study_tables(
+        invasive_file = study_pairs$Invasive[study_index],
+        native_file = study_pairs$Native[study_index],
+        study = current_study
+      )
+
+      # ------------------------------------------------------------------------
+      # Alpha diversity
+      # ------------------------------------------------------------------------
+      alpha_preparation <- prepare_alpha_matrix(
+        count_matrix = merged$count_matrix,
+        metadata = merged$metadata
+      )
+
+      retained_metadata <- merged$metadata |>
+        filter(
+          SampleID %in%
+            colnames(alpha_preparation$alpha_matrix)
+        )
+
+      alpha_wide <- calculate_alpha(
+        alpha_matrix = alpha_preparation$alpha_matrix,
+        metadata = retained_metadata
+      )
+
+      alpha_long <- alpha_wide |>
+        pivot_longer(
+          cols = c(
+            Chao1,
+            Richness,
+            Shannon,
+            Simpson
+          ),
+          names_to = "Metric",
+          values_to = "AlphaValue"
+        ) |>
+        mutate(
+          Metric = factor(
+            Metric,
+            levels = metric_levels
+          )
+        )
+
+      alpha_group <- alpha_long |>
+        group_by(
+          Study,
+          Status,
+          PlantGroup,
+          PlantGroup_raw,
+          Metric
+        ) |>
+        summarise(
+          MeanAlpha = mean(
+            AlphaValue,
+            na.rm = TRUE
+          ),
+          n_samples = n(),
+          .groups = "drop"
+        )
+
+      alpha_effects <- alpha_group |>
+        group_by(
+          Study,
+          Metric
+        ) |>
+        group_modify(
+          ~ calculate_hedges_g(
+            invasive_values =
+              .x$MeanAlpha[
+                .x$Status == "Invasive"
+              ],
+            native_values =
+              .x$MeanAlpha[
+                .x$Status == "Native"
+              ]
+          )
+        ) |>
+        ungroup()
+
+      # ------------------------------------------------------------------------
+      # Beta diversity
+      # ------------------------------------------------------------------------
+      relative_abundance <- prepare_beta_relative_abundance(
+        merged$count_matrix
+      )
+
+      centroid_result <- calculate_plantgroup_centroids(
+        relative_abundance,
+        merged$metadata
+      )
+
+      delta_bray <- calculate_delta_bray(
+        centroid_result$centroid_matrix,
+        centroid_result$centroid_metadata$Status
+      )
+
+      delta_bootstrap <- bootstrap_delta_bray(
+        centroid_result$centroid_matrix,
+        centroid_result$centroid_metadata$Status,
+        n_boot = N_BOOT
+      )
+
+      delta_permutation_p <- permutation_delta_bray_p(
+        centroid_result$centroid_matrix,
+        centroid_result$centroid_metadata$Status,
+        observed_delta = delta_bray$Delta_BrayCurtis,
+        n_perm = N_PERM
+      )
+
+      permanova_result <- calculate_permanova(
+        centroid_result$centroid_matrix,
+        centroid_result$centroid_metadata
+      )
+
+      dispersion_result <- calculate_beta_dispersion(
+        centroid_result$centroid_matrix,
+        centroid_result$centroid_metadata
+      )
+
+      pcoa_result <- calculate_pcoa(
+        centroid_result$centroid_matrix,
+        centroid_result$centroid_metadata,
+        current_study
+      )
+
+      beta_summary <- tibble::tibble(
+        Study = current_study,
+        StudyNumber = study_number(current_study),
+        n_Invasive_PlantGroups = sum(
+          centroid_result$centroid_metadata$Status == "Invasive"
+        ),
+        n_Native_PlantGroups = sum(
+          centroid_result$centroid_metadata$Status == "Native"
+        )
+      ) |>
+        bind_cols(
+          delta_bray,
+          tibble::tibble(
+            Delta_Bray_Bootstrap_SE =
+              delta_bootstrap$SE,
+            Delta_Bray_CI_low =
+              delta_bootstrap$CI_low,
+            Delta_Bray_CI_high =
+              delta_bootstrap$CI_high,
+            Delta_Bray_Permutation_P =
+              delta_permutation_p
+          ),
+          permanova_result,
+          dispersion_result$summary
+        )
+
+      if (length(delta_bootstrap$values) > 0) {
+        bootstrap_delta_list[[current_study]] <- tibble::tibble(
+          Study = current_study,
+          Bootstrap_iteration =
+            seq_along(delta_bootstrap$values),
+          Delta_BrayCurtis =
+            delta_bootstrap$values
+        )
+      }
+
+      # ------------------------------------------------------------------------
+      # Per-study export
+      # ------------------------------------------------------------------------
+      study_output_dir <- file.path(
+        STUDY_DIR,
+        current_study
+      )
+
+      dir.create(
+        study_output_dir,
+        recursive = TRUE,
+        showWarnings = FALSE
+      )
+
+      per_study_workbook <- openxlsx::createWorkbook()
+
+      per_study_tables <- list(
+        Metadata = merged$metadata,
+        Library_depth =
+          alpha_preparation$depth_table,
+        Alpha_sample = alpha_long,
+        Alpha_PlantGroup = alpha_group,
+        Alpha_effects = alpha_effects,
+        Beta_summary = beta_summary,
+        Beta_dispersion =
+          dispersion_result$values,
+        PCoA = pcoa_result
+      )
+
+      for (sheet_name in names(per_study_tables)) {
+        openxlsx::addWorksheet(
+          per_study_workbook,
+          sheet_name
+        )
+
+        openxlsx::writeData(
+          per_study_workbook,
+          sheet_name,
+          per_study_tables[[sheet_name]]
+        )
+      }
+
+      openxlsx::saveWorkbook(
+        per_study_workbook,
+        file.path(
+          study_output_dir,
+          paste0(
+            current_study,
+            "_",
+            MARKER,
+            "_alpha_beta_results.xlsx"
+          )
+        ),
+        overwrite = TRUE
+      )
+
+      saveRDS(
+        list(
+          centroid_matrix =
+            centroid_result$centroid_matrix,
+          centroid_metadata =
+            centroid_result$centroid_metadata,
+          beta_summary =
+            beta_summary
+        ),
+        file.path(
+          study_output_dir,
+          paste0(
+            current_study,
+            "_",
+            MARKER,
+            "_community_objects.rds"
+          )
+        )
+      )
+
+      list(
+        alpha_sample = alpha_long,
+        alpha_group = alpha_group,
+        alpha_effects = alpha_effects,
+        metadata = merged$metadata,
+        depth = alpha_preparation$depth_table,
+        beta_summary = beta_summary,
+        dispersion_values =
+          dispersion_result$values,
+        pcoa = pcoa_result,
+        centroid_data =
+          centroid_result$centroid_data
+      )
+    },
+    error = function(e) {
+      run_log_list[[current_study]] <<- tibble::tibble(
+        Study = current_study,
+        Status = "ERROR",
+        Message = e$message
+      )
+
+      message(
+        "ERROR in ",
+        current_study,
+        ": ",
+        e$message
+      )
+
+      NULL
+    }
+  )
+
+  if (!is.null(result)) {
+    alpha_sample_list[[current_study]] <-
+      result$alpha_sample
+
+    alpha_group_list[[current_study]] <-
+      result$alpha_group
+
+    alpha_effect_list[[current_study]] <-
+      result$alpha_effects
+
+    metadata_list[[current_study]] <-
+      result$metadata
+
+    depth_list[[current_study]] <-
+      result$depth
+
+    beta_summary_list[[current_study]] <-
+      result$beta_summary
+
+    dispersion_value_list[[current_study]] <-
+      result$dispersion_values
+
+    pcoa_list[[current_study]] <-
+      result$pcoa
+
+    centroid_data_list[[current_study]] <-
+      result$centroid_data
+
+    run_log_list[[current_study]] <- tibble::tibble(
+      Study = current_study,
+      Status = "OK",
+      Message = ""
+    )
+  }
+}
+
+
+# ==============================================================================
+# 10. COMBINE STUDIES
+# ==============================================================================
+
+alpha_sample_all <- bind_rows(alpha_sample_list)
+alpha_group_all <- bind_rows(alpha_group_list)
+alpha_effects_all <- bind_rows(alpha_effect_list)
+metadata_all <- bind_rows(metadata_list)
+depth_all <- bind_rows(depth_list)
+
+beta_summary_all <- bind_rows(beta_summary_list)
+dispersion_values_all <- bind_rows(
+  dispersion_value_list
+)
+pcoa_all <- bind_rows(pcoa_list)
+bootstrap_delta_all <- bind_rows(
+  bootstrap_delta_list
+)
+run_log <- bind_rows(run_log_list)
+
+if (nrow(alpha_sample_all) == 0) {
+  stop(
+    "No study completed successfully. Inspect the run log."
+  )
+}
+
+
+# ==============================================================================
+# 11. ALPHA INFERENCE
+# ==============================================================================
+
+alpha_sample_z <- alpha_sample_all |>
+  group_by(
+    Study,
+    Metric
+  ) |>
+  mutate(
+    StudyMetricMean = mean(
+      AlphaValue,
+      na.rm = TRUE
+    ),
+    StudyMetricSD = stats::sd(
+      AlphaValue,
+      na.rm = TRUE
+    ),
+    Alpha_z = ifelse(
+      is.finite(StudyMetricSD) &
+        StudyMetricSD > 0,
+      (
+        AlphaValue -
+          StudyMetricMean
+      ) /
+        StudyMetricSD,
+      NA_real_
+    )
+  ) |>
+  ungroup() |>
+  filter(
+    is.finite(Alpha_z)
+  )
+
+alpha_group_z <- alpha_sample_z |>
+  group_by(
+    Study,
+    Status,
+    PlantGroup,
+    PlantGroup_raw,
+    Metric
+  ) |>
+  summarise(
+    MeanAlpha_z = mean(
+      Alpha_z,
+      na.rm = TRUE
+    ),
+    n_samples = n(),
+    .groups = "drop"
+  )
+
+fit_alpha_model <- function(metric_name) {
+  metric_data <- alpha_sample_z |>
+    filter(
+      Metric == metric_name
+    ) |>
+    mutate(
+      Status = factor(
+        Status,
+        levels = c("Native", "Invasive")
+      ),
+      Study = factor(Study),
+      PlantGroup = factor(PlantGroup)
+    )
+
+  full_model <- try(
+    lmerTest::lmer(
+      Alpha_z ~
+        Status +
+        (1 | Study) +
+        (1 | PlantGroup),
+      data = metric_data,
+      REML = TRUE
+    ),
+    silent = TRUE
+  )
+
+  if (!inherits(full_model, "try-error")) {
+    model <- full_model
+    model_formula <- paste0(
+      "Alpha_z ~ Status + ",
+      "(1|Study) + (1|PlantGroup)"
+    )
+  } else {
+    model <- lmerTest::lmer(
+      Alpha_z ~
+        Status +
+        (1 | Study),
+      data = metric_data,
+      REML = TRUE
+    )
+
+    model_formula <- paste0(
+      "Alpha_z ~ Status + ",
+      "(1|Study)"
+    )
+  }
+
+  coefficients <- summary(model)$coefficients
+
+  tibble::tibble(
+    Metric = metric_name,
+    Model = model_formula,
+    Singular = lme4::isSingular(
+      model,
+      tol = 1e-5
+    ),
+    Estimate_Invasive_minus_Native =
+      coefficients[
+        "StatusInvasive",
+        "Estimate"
+      ],
+    SE =
+      coefficients[
+        "StatusInvasive",
+        "Std. Error"
+      ],
+    df =
+      coefficients[
+        "StatusInvasive",
+        "df"
+      ],
+    t_value =
+      coefficients[
+        "StatusInvasive",
+        "t value"
+      ],
+    P =
+      coefficients[
+        "StatusInvasive",
+        "Pr(>|t|)"
+      ]
+  )
+}
+
+alpha_model_results <- bind_rows(
+  lapply(
+    metric_levels,
+    fit_alpha_model
+  )
+) |>
+  mutate(
+    P_adjusted = p.adjust(
+      P,
+      method = "BH"
+    ),
+    Significance =
+      p_to_star(P_adjusted),
+    P_label = vapply(
+      P_adjusted,
+      format_p,
+      adjusted = TRUE,
+      FUN.VALUE = character(1)
+    )
+  )
+
+# Study-level raw alpha differences
+status_mean_alpha <- alpha_group_all |>
+  group_by(
+    Study,
+    Metric,
+    Status
+  ) |>
+  summarise(
+    StatusMean = mean(
+      MeanAlpha,
+      na.rm = TRUE
+    ),
+    SD_among_PlantGroups = stats::sd(
+      MeanAlpha,
+      na.rm = TRUE
+    ),
+    n_PlantGroups =
+      n_distinct(PlantGroup),
+    .groups = "drop"
+  )
+
+study_delta_alpha <- status_mean_alpha |>
+  pivot_wider(
+    names_from = Status,
+    values_from = c(
+      StatusMean,
+      SD_among_PlantGroups,
+      n_PlantGroups
+    )
+  ) |>
+  mutate(
+    Delta_alpha =
+      StatusMean_Invasive -
+      StatusMean_Native,
+    StudyNumber =
+      study_number(Study)
+  ) |>
+  filter(
+    is.finite(Delta_alpha)
+  )
+
+test_alpha_delta <- function(metric_name) {
+  values <- study_delta_alpha |>
+    filter(
+      Metric == metric_name
+    ) |>
+    pull(Delta_alpha)
+
+  values <- values[is.finite(values)]
+
+  if (length(values) < 2) {
+    return(
+      tibble::tibble(
+        Metric = metric_name,
+        n_studies = length(values),
+        Mean_Delta = safe_mean(values),
+        Median_Delta = ifelse(
+          length(values) > 0,
+          median(values),
+          NA_real_
+        ),
+        W = NA_real_,
+        P = NA_real_
+      )
+    )
+  }
+
+  test <- stats::wilcox.test(
+    values,
+    mu = 0,
+    exact = FALSE
+  )
+
+  tibble::tibble(
+    Metric = metric_name,
+    n_studies = length(values),
+    Mean_Delta = mean(values),
+    Median_Delta = median(values),
+    W = unname(test$statistic),
+    P = test$p.value
+  )
+}
+
+alpha_delta_tests <- bind_rows(
+  lapply(
+    metric_levels,
+    test_alpha_delta
+  )
+) |>
+  mutate(
+    P_adjusted = p.adjust(
+      P,
+      method = "BH"
+    ),
+    Significance =
+      p_to_star(P_adjusted),
+    P_label = vapply(
+      P_adjusted,
+      format_p,
+      adjusted = TRUE,
+      FUN.VALUE = character(1)
+    )
+  )
+
+# Random-effects meta-analysis of Hedges' g
+alpha_meta_summary <- bind_rows(
+  lapply(
+    metric_levels,
+    function(metric_name) {
+      dat <- alpha_effects_all |>
+        filter(
+          Metric == metric_name,
+          is.finite(Hedges_g),
+          is.finite(var_g),
+          var_g > 0
+        )
+
+      if (nrow(dat) < 2) {
+        return(
+          tibble::tibble(
+            Metric = metric_name,
+            k = nrow(dat),
+            Estimate = NA_real_,
+            SE = NA_real_,
+            CI_low = NA_real_,
+            CI_high = NA_real_,
+            P = NA_real_,
+            tau2 = NA_real_,
+            I2 = NA_real_
+          )
+        )
+      }
+
+      fit <- metafor::rma.uni(
+        yi = dat$Hedges_g,
+        vi = dat$var_g,
+        method = "REML"
+      )
+
+      tibble::tibble(
+        Metric = metric_name,
+        k = fit$k,
+        Estimate = as.numeric(fit$b),
+        SE = fit$se,
+        CI_low = fit$ci.lb,
+        CI_high = fit$ci.ub,
+        P = fit$pval,
+        tau2 = fit$tau2,
+        I2 = fit$I2
+      )
+    }
+  )
 )
 
-write.xlsx(
-  run_summary,
-  file = file.path(out_dir, "run_summary.xlsx"),
-  rowNames = FALSE
+
+# ==============================================================================
+# 12. BETA INFERENCE
+# ==============================================================================
+
+# Study-level P-value adjustment
+beta_summary_all <- beta_summary_all |>
+  mutate(
+    Delta_Bray_Permutation_P_BH =
+      p.adjust(
+        Delta_Bray_Permutation_P,
+        method = "BH"
+      ),
+    PERMANOVA_P_BH =
+      p.adjust(
+        PERMANOVA_P,
+        method = "BH"
+      ),
+    PERMDISP_P_BH =
+      p.adjust(
+        PERMDISP_P,
+        method = "BH"
+      )
+  )
+
+# Equal-weight across-study test for Delta Bray-Curtis
+delta_bray_values <- beta_summary_all$Delta_BrayCurtis
+delta_bray_values <- delta_bray_values[
+  is.finite(delta_bray_values)
+]
+
+if (length(delta_bray_values) >= 2) {
+  delta_bray_wilcox <- stats::wilcox.test(
+    delta_bray_values,
+    mu = 0,
+    exact = FALSE
+  )
+
+  delta_bray_overall <- tibble::tibble(
+    Test = "One-sample Wilcoxon signed-rank test",
+    Null_value = 0,
+    n_studies = length(delta_bray_values),
+    Mean_Delta = mean(delta_bray_values),
+    Median_Delta = median(delta_bray_values),
+    W = unname(delta_bray_wilcox$statistic),
+    P = delta_bray_wilcox$p.value,
+    Significance =
+      p_to_star(delta_bray_wilcox$p.value)
+  )
+} else {
+  delta_bray_overall <- tibble::tibble(
+    Test = "One-sample Wilcoxon signed-rank test",
+    Null_value = 0,
+    n_studies = length(delta_bray_values),
+    Mean_Delta = safe_mean(delta_bray_values),
+    Median_Delta = NA_real_,
+    W = NA_real_,
+    P = NA_real_,
+    Significance = "NA"
+  )
+}
+
+# Random-effects synthesis of Delta Bray-Curtis
+delta_meta_data <- beta_summary_all |>
+  filter(
+    is.finite(Delta_BrayCurtis),
+    is.finite(Delta_Bray_Bootstrap_SE),
+    Delta_Bray_Bootstrap_SE > 0
+  ) |>
+  mutate(
+    Sampling_variance =
+      Delta_Bray_Bootstrap_SE^2
+  )
+
+delta_bray_meta_summary <- tibble::tibble(
+  k = 0,
+  Estimate = NA_real_,
+  SE = NA_real_,
+  CI_low = NA_real_,
+  CI_high = NA_real_,
+  P = NA_real_,
+  tau2 = NA_real_,
+  I2 = NA_real_
 )
 
-cat("\n====================================\n")
-cat("Analysis completed successfully.\n")
-cat("Output directory:\n", out_dir, "\n")
-cat("Summary file:\n", summary_file, "\n")
-cat("====================================\n")
+delta_bray_meta_fit <- NULL
+
+if (nrow(delta_meta_data) >= 2) {
+  delta_bray_meta_fit <- metafor::rma.uni(
+    yi = delta_meta_data$Delta_BrayCurtis,
+    vi = delta_meta_data$Sampling_variance,
+    method = "REML"
+  )
+
+  delta_bray_meta_summary <- tibble::tibble(
+    k = delta_bray_meta_fit$k,
+    Estimate = as.numeric(
+      delta_bray_meta_fit$b
+    ),
+    SE = delta_bray_meta_fit$se,
+    CI_low = delta_bray_meta_fit$ci.lb,
+    CI_high = delta_bray_meta_fit$ci.ub,
+    P = delta_bray_meta_fit$pval,
+    tau2 = delta_bray_meta_fit$tau2,
+    I2 = delta_bray_meta_fit$I2
+  )
+}
+
+# Paired across-study beta-dispersion comparison
+dispersion_study <- beta_summary_all |>
+  filter(
+    is.finite(Dispersion_Invasive),
+    is.finite(Dispersion_Native)
+  )
+
+if (nrow(dispersion_study) >= 2) {
+  dispersion_wilcox <- stats::wilcox.test(
+    dispersion_study$Dispersion_Invasive,
+    dispersion_study$Dispersion_Native,
+    paired = TRUE,
+    exact = FALSE
+  )
+
+  dispersion_overall <- tibble::tibble(
+    Test = "Paired Wilcoxon signed-rank test",
+    Contrast = "Invasive - Native",
+    n_studies = nrow(dispersion_study),
+    Mean_difference = mean(
+      dispersion_study$Delta_Dispersion
+    ),
+    Median_difference = median(
+      dispersion_study$Delta_Dispersion
+    ),
+    W = unname(dispersion_wilcox$statistic),
+    P = dispersion_wilcox$p.value,
+    Significance =
+      p_to_star(dispersion_wilcox$p.value)
+  )
+} else {
+  dispersion_overall <- tibble::tibble(
+    Test = "Paired Wilcoxon signed-rank test",
+    Contrast = "Invasive - Native",
+    n_studies = nrow(dispersion_study),
+    Mean_difference = NA_real_,
+    Median_difference = NA_real_,
+    W = NA_real_,
+    P = NA_real_,
+    Significance = "NA"
+  )
+}
+
+
+# ==============================================================================
+# 13. OPTIONAL GLOBAL PARTIAL dbRDA
+# ==============================================================================
+
+global_dbrda_summary <- tibble::tibble()
+global_dbrda_scores <- tibble::tibble()
+
+if (
+  RUN_GLOBAL_PARTIAL_DBRDA &&
+    length(centroid_data_list) > 0
+) {
+  global_centroid_data <- bind_rows(
+    centroid_data_list
+  )
+
+  metadata_columns <- c(
+    "Study",
+    "Status",
+    "PlantGroup",
+    "PlantGroup_raw",
+    "n_samples"
+  )
+
+  feature_columns <- setdiff(
+    colnames(global_centroid_data),
+    metadata_columns
+  )
+
+  for (feature_name in feature_columns) {
+    global_centroid_data[[feature_name]][
+      is.na(
+        global_centroid_data[[feature_name]]
+      )
+    ] <- 0
+  }
+
+  global_metadata <- global_centroid_data |>
+    select(
+      all_of(metadata_columns)
+    ) |>
+    mutate(
+      Study = factor(Study),
+      Status = factor(
+        Status,
+        levels = c("Native", "Invasive")
+      )
+    )
+
+  global_community <- global_centroid_data |>
+    select(
+      all_of(feature_columns)
+    ) |>
+    as.matrix()
+
+  storage.mode(global_community) <- "numeric"
+
+  keep_feature <- colSums(
+    global_community > 0
+  ) >= 2
+
+  global_community <- global_community[
+    ,
+    keep_feature,
+    drop = FALSE
+  ]
+
+  if (
+    nrow(global_community) > 3 &&
+      ncol(global_community) > 0
+  ) {
+    global_dbrda_model <- vegan::dbrda(
+      global_community ~
+        Status +
+        Condition(Study),
+      data = global_metadata,
+      distance = "bray",
+      sqrt.dist = TRUE
+    )
+
+    permutation_design <- permute::how(
+      nperm = N_PERM,
+      blocks = global_metadata$Study
+    )
+
+    global_dbrda_test <- vegan::anova.cca(
+      global_dbrda_model,
+      by = "terms",
+      permutations = permutation_design
+    )
+
+    global_dbrda_r2 <- vegan::RsquareAdj(
+      global_dbrda_model
+    )
+
+    test_table <- as.data.frame(
+      global_dbrda_test
+    ) |>
+      tibble::rownames_to_column("Term")
+
+    p_column <- grep(
+      "^Pr",
+      colnames(test_table),
+      value = TRUE
+    )[1]
+
+    status_row <- test_table |>
+      filter(Term == "Status")
+
+    global_dbrda_summary <- tibble::tibble(
+      n_PlantGroups = nrow(global_community),
+      n_features = ncol(global_community),
+      R2 = global_dbrda_r2$r.squared,
+      Adjusted_R2 =
+        global_dbrda_r2$adj.r.squared,
+      Status_F = ifelse(
+        nrow(status_row) > 0,
+        status_row$F[1],
+        NA_real_
+      ),
+      Status_P = ifelse(
+        nrow(status_row) > 0,
+        status_row[[p_column]][1],
+        NA_real_
+      )
+    )
+
+    scores <- vegan::scores(
+      global_dbrda_model,
+      display = "sites",
+      choices = 1:2,
+      scaling = 2
+    ) |>
+      as.matrix()
+
+    if (ncol(scores) == 1) {
+      scores <- cbind(
+        scores,
+        Axis2 = 0
+      )
+    }
+
+    global_dbrda_scores <- tibble::tibble(
+      Axis1 = scores[, 1],
+      Axis2 = scores[, 2]
+    ) |>
+      bind_cols(global_metadata)
+
+    saveRDS(
+      global_dbrda_model,
+      file.path(
+        OBJECT_DIR,
+        paste0(
+          MARKER,
+          "_global_partial_dbRDA.rds"
+        )
+      )
+    )
+  }
+}
+
+
+# ==============================================================================
+# 14. PLOTS: ALPHA DIVERSITY
+# ==============================================================================
+
+count_table <- alpha_sample_all |>
+  distinct(
+    Study,
+    SampleID,
+    Status,
+    PlantGroup
+  ) |>
+  group_by(Status) |>
+  summarise(
+    n_groups = n_distinct(PlantGroup),
+    n_samples = n(),
+    .groups = "drop"
+  )
+
+count_caption <- paste0(
+  "Boxplots and solid points summarize PlantGroup means; ",
+  "faint points show samples. ",
+  paste(
+    paste0(
+      count_table$Status,
+      ": ",
+      count_table$n_groups,
+      " groups / ",
+      count_table$n_samples,
+      " samples"
+    ),
+    collapse = "; "
+  ),
+  "."
+)
+
+# 14.1 Raw alpha diversity
+raw_annotation <- alpha_group_all |>
+  group_by(Metric) |>
+  summarise(
+    y_min = min(MeanAlpha, na.rm = TRUE),
+    y_max = max(MeanAlpha, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  left_join(
+    alpha_model_results |>
+      select(
+        Metric,
+        P_label
+      ),
+    by = "Metric"
+  ) |>
+  mutate(
+    y_range = pmax(
+      y_max - y_min,
+      abs(y_max) * 0.08,
+      0.01
+    ),
+    y_bar = y_max + 0.08 * y_range,
+    y_text = y_max + 0.16 * y_range
+  )
+
+p_alpha_raw <- ggplot(
+  alpha_group_all,
+  aes(
+    x = Status,
+    y = MeanAlpha,
+    fill = Status
+  )
+) +
+  geom_boxplot(
+    width = 0.52,
+    outlier.shape = NA,
+    alpha = 0.78,
+    color = "grey20",
+    linewidth = 0.85
+  ) +
+  geom_jitter(
+    data = alpha_sample_all,
+    aes(
+      x = Status,
+      y = AlphaValue,
+      color = Status
+    ),
+    inherit.aes = FALSE,
+    width = 0.15,
+    size = 1.0,
+    alpha = 0.18
+  ) +
+  geom_point(
+    aes(color = Status),
+    shape = 21,
+    size = 2.7,
+    stroke = 0.50,
+    position = position_jitter(
+      width = 0.075,
+      height = 0
+    )
+  ) +
+  geom_segment(
+    data = raw_annotation,
+    aes(
+      x = 1,
+      xend = 2,
+      y = y_bar,
+      yend = y_bar
+    ),
+    inherit.aes = FALSE,
+    linewidth = 0.7
+  ) +
+  geom_segment(
+    data = raw_annotation,
+    aes(
+      x = 1,
+      xend = 1,
+      y = y_bar,
+      yend = y_bar - 0.035 * y_range
+    ),
+    inherit.aes = FALSE,
+    linewidth = 0.7
+  ) +
+  geom_segment(
+    data = raw_annotation,
+    aes(
+      x = 2,
+      xend = 2,
+      y = y_bar,
+      yend = y_bar - 0.035 * y_range
+    ),
+    inherit.aes = FALSE,
+    linewidth = 0.7
+  ) +
+  geom_text(
+    data = raw_annotation,
+    aes(
+      x = 1.5,
+      y = y_text,
+      label = P_label
+    ),
+    inherit.aes = FALSE,
+    fontface = "bold",
+    size = 3.4
+  ) +
+  facet_wrap(
+    ~ Metric,
+    nrow = 1,
+    scales = "free_y",
+    labeller = as_labeller(metric_labels)
+  ) +
+  scale_fill_manual(
+    values = STATUS_COLORS
+  ) +
+  scale_color_manual(
+    values = STATUS_COLORS
+  ) +
+  scale_y_continuous(
+    expand = expansion(
+      mult = c(0.03, 0.22)
+    )
+  ) +
+  labs(
+    title = paste0(
+      MARKER,
+      " raw alpha diversity"
+    ),
+    subtitle = paste0(
+      "Mixed-effects inference on within-study standardized values"
+    ),
+    x = NULL,
+    y = "Alpha diversity",
+    caption = count_caption
+  ) +
+  theme_publication +
+  theme(
+    legend.position = "none"
+  )
+
+# 14.2 Standardized alpha diversity
+alpha_sample_z_plot <- alpha_sample_z |>
+  mutate(
+    Alpha_z_plot = pmin(
+      pmax(
+        Alpha_z,
+        STANDARDIZED_Y_MIN
+      ),
+      STANDARDIZED_Y_MAX
+    ),
+    Outlier_position = case_when(
+      Alpha_z < STANDARDIZED_Y_MIN ~ "Below",
+      Alpha_z > STANDARDIZED_Y_MAX ~ "Above",
+      TRUE ~ "Inside"
+    )
+  )
+
+alpha_group_z_plot <- alpha_group_z |>
+  mutate(
+    MeanAlpha_z_plot = pmin(
+      pmax(
+        MeanAlpha_z,
+        STANDARDIZED_Y_MIN
+      ),
+      STANDARDIZED_Y_MAX
+    )
+  )
+
+standardized_annotation <- alpha_model_results |>
+  mutate(
+    Metric = factor(
+      Metric,
+      levels = metric_levels
+    ),
+    y_bar =
+      STANDARDIZED_Y_MAX - 0.58,
+    y_tick =
+      STANDARDIZED_Y_MAX - 0.73,
+    y_text =
+      STANDARDIZED_Y_MAX - 0.38
+  )
+
+p_alpha_standardized <- ggplot(
+  alpha_group_z_plot,
+  aes(
+    x = Status,
+    y = MeanAlpha_z_plot,
+    fill = Status
+  )
+) +
+  geom_hline(
+    yintercept = 0,
+    linetype = "dashed",
+    color = "grey50",
+    linewidth = 0.55
+  ) +
+  geom_boxplot(
+    width = 0.52,
+    outlier.shape = NA,
+    alpha = 0.78,
+    color = "grey20",
+    linewidth = 0.85
+  ) +
+  geom_jitter(
+    data = alpha_sample_z_plot |>
+      filter(
+        Outlier_position == "Inside"
+      ),
+    aes(
+      x = Status,
+      y = Alpha_z_plot,
+      color = Status
+    ),
+    inherit.aes = FALSE,
+    width = 0.15,
+    size = 1.1,
+    alpha = 0.20
+  ) +
+  geom_point(
+    data = alpha_sample_z_plot |>
+      filter(
+        Outlier_position == "Above"
+      ),
+    aes(
+      x = Status,
+      y = STANDARDIZED_Y_MAX,
+      color = Status
+    ),
+    inherit.aes = FALSE,
+    shape = 24,
+    size = 2.0,
+    alpha = 0.55,
+    position = position_jitter(
+      width = 0.11,
+      height = 0
+    )
+  ) +
+  geom_point(
+    data = alpha_sample_z_plot |>
+      filter(
+        Outlier_position == "Below"
+      ),
+    aes(
+      x = Status,
+      y = STANDARDIZED_Y_MIN,
+      color = Status
+    ),
+    inherit.aes = FALSE,
+    shape = 25,
+    size = 2.0,
+    alpha = 0.55,
+    position = position_jitter(
+      width = 0.11,
+      height = 0
+    )
+  ) +
+  geom_point(
+    aes(color = Status),
+    shape = 21,
+    size = 2.7,
+    stroke = 0.50,
+    position = position_jitter(
+      width = 0.075,
+      height = 0
+    )
+  ) +
+  geom_segment(
+    data = standardized_annotation,
+    aes(
+      x = 1,
+      xend = 2,
+      y = y_bar,
+      yend = y_bar
+    ),
+    inherit.aes = FALSE,
+    linewidth = 0.7
+  ) +
+  geom_segment(
+    data = standardized_annotation,
+    aes(
+      x = 1,
+      xend = 1,
+      y = y_bar,
+      yend = y_tick
+    ),
+    inherit.aes = FALSE,
+    linewidth = 0.7
+  ) +
+  geom_segment(
+    data = standardized_annotation,
+    aes(
+      x = 2,
+      xend = 2,
+      y = y_bar,
+      yend = y_tick
+    ),
+    inherit.aes = FALSE,
+    linewidth = 0.7
+  ) +
+  geom_text(
+    data = standardized_annotation,
+    aes(
+      x = 1.5,
+      y = y_text,
+      label = P_label
+    ),
+    inherit.aes = FALSE,
+    fontface = "bold",
+    size = 3.4
+  ) +
+  facet_wrap(
+    ~ Metric,
+    nrow = 1,
+    scales = "fixed",
+    labeller = as_labeller(metric_labels)
+  ) +
+  scale_fill_manual(
+    values = STATUS_COLORS
+  ) +
+  scale_color_manual(
+    values = STATUS_COLORS
+  ) +
+  scale_y_continuous(
+    limits = c(
+      STANDARDIZED_Y_MIN,
+      STANDARDIZED_Y_MAX
+    ),
+    breaks = seq(
+      ceiling(STANDARDIZED_Y_MIN),
+      floor(STANDARDIZED_Y_MAX),
+      by = 1
+    ),
+    expand = expansion(
+      mult = c(0.015, 0.015)
+    )
+  ) +
+  labs(
+    title = paste0(
+      MARKER,
+      " within-study standardized alpha diversity"
+    ),
+    subtitle = paste0(
+      "Values were standardized separately within each study and metric"
+    ),
+    x = NULL,
+    y = "Standardized alpha diversity (z score)",
+    caption = paste0(
+      count_caption,
+      " Triangles indicate values outside the displayed y-axis range."
+    )
+  ) +
+  theme_publication +
+  theme(
+    legend.position = "none"
+  )
+
+# 14.3 Study-level raw alpha differences
+make_delta_panel <- function(metric_name) {
+  panel_data <- study_delta_alpha |>
+    filter(
+      Metric == metric_name
+    )
+
+  panel_test <- alpha_delta_tests |>
+    filter(
+      Metric == metric_name
+    )
+
+  y_min <- min(
+    panel_data$Delta_alpha,
+    na.rm = TRUE
+  )
+
+  y_max <- max(
+    panel_data$Delta_alpha,
+    na.rm = TRUE
+  )
+
+  y_range <- max(
+    y_max - y_min,
+    abs(y_max) * 0.10,
+    0.01
+  )
+
+  ggplot(
+    panel_data,
+    aes(
+      x = MARKER,
+      y = Delta_alpha
+    )
+  ) +
+    geom_hline(
+      yintercept = 0,
+      linetype = "dashed",
+      color = "red",
+      linewidth = 0.55
+    ) +
+    geom_boxplot(
+      width = 0.40,
+      outlier.shape = NA,
+      fill = "white",
+      color = "black",
+      linewidth = 0.75
+    ) +
+    geom_jitter(
+      width = 0.075,
+      size = 2.2,
+      alpha = 0.85
+    ) +
+    annotate(
+      "text",
+      x = 1,
+      y = y_max + 0.13 * y_range,
+      label = panel_test$Significance,
+      color = ifelse(
+        panel_test$Significance == "ns",
+        "blue",
+        "red"
+      ),
+      fontface = "bold",
+      size = 5
+    ) +
+    labs(
+      title = metric_labels[[metric_name]],
+      subtitle = panel_test$P_label,
+      x = NULL,
+      y = expression(
+        Delta~"alpha diversity (Invasive - Native)"
+      )
+    ) +
+    scale_y_continuous(
+      expand = expansion(
+        mult = c(0.07, 0.22)
+      )
+    ) +
+    theme_publication +
+    theme(
+      axis.text.x = element_text(
+        face = "bold"
+      )
+    )
+}
+
+delta_panels <- lapply(
+  metric_levels,
+  make_delta_panel
+)
+
+names(delta_panels) <- metric_levels
+
+p_alpha_delta <- (
+  delta_panels[["Richness"]] +
+    delta_panels[["Chao1"]]
+) / (
+  delta_panels[["Shannon"]] +
+    delta_panels[["Simpson"]]
+) +
+  patchwork::plot_annotation(
+    title = paste0(
+      MARKER,
+      " study-level raw alpha-diversity differences"
+    ),
+    subtitle = paste0(
+      "Each point represents one study; PlantGroups are equally weighted"
+    ),
+    tag_levels = "A"
+  )
+
+
+# ==============================================================================
+# 15. PLOTS: ALPHA EFFECT-SIZE FORESTS
+# ==============================================================================
+
+make_alpha_forest <- function(metric_name) {
+  dat <- alpha_effects_all |>
+    filter(
+      Metric == metric_name,
+      is.finite(Hedges_g),
+      is.finite(var_g),
+      var_g > 0,
+      is.finite(ci_low),
+      is.finite(ci_high)
+    ) |>
+    mutate(
+      StudyNumber = study_number(Study)
+    ) |>
+    arrange(StudyNumber)
+
+  if (nrow(dat) == 0) {
+    return(
+      ggplot() +
+        annotate(
+          "text",
+          x = 0,
+          y = 0,
+          label = paste0(
+            metric_name,
+            ": no valid effects"
+          )
+        ) +
+        theme_void()
+    )
+  }
+
+  dat <- dat |>
+    mutate(
+      y = rev(seq_len(n()))
+    )
+
+  meta_fit <- NULL
+
+  if (nrow(dat) >= 2) {
+    meta_fit <- metafor::rma.uni(
+      yi = dat$Hedges_g,
+      vi = dat$var_g,
+      method = "REML"
+    )
+  }
+
+  plot_object <- ggplot(dat) +
+    geom_vline(
+      xintercept = 0,
+      linetype = "dashed",
+      color = "red",
+      linewidth = 0.55
+    ) +
+    geom_segment(
+      aes(
+        x = ci_low,
+        xend = ci_high,
+        y = y,
+        yend = y
+      ),
+      linewidth = 0.55
+    ) +
+    geom_point(
+      aes(
+        x = Hedges_g,
+        y = y
+      ),
+      size = 2.3
+    )
+
+  y_breaks <- dat$y
+  y_labels <- dat$Study
+  subtitle_text <- paste0(
+    nrow(dat),
+    " studies"
+  )
+
+  if (!is.null(meta_fit)) {
+    pooled <- tibble::tibble(
+      Estimate = as.numeric(meta_fit$b),
+      CI_low = meta_fit$ci.lb,
+      CI_high = meta_fit$ci.ub,
+      y = 0
+    )
+
+    plot_object <- plot_object +
+      geom_segment(
+        data = pooled,
+        aes(
+          x = CI_low,
+          xend = CI_high,
+          y = y,
+          yend = y
+        ),
+        inherit.aes = FALSE,
+        linewidth = 1.0
+      ) +
+      geom_point(
+        data = pooled,
+        aes(
+          x = Estimate,
+          y = y
+        ),
+        inherit.aes = FALSE,
+        shape = 23,
+        size = 4.0,
+        fill = "white",
+        stroke = 0.9
+      )
+
+    y_breaks <- c(0, y_breaks)
+    y_labels <- c("Pooled", y_labels)
+
+    subtitle_text <- paste0(
+      "REML pooled g = ",
+      formatC(
+        as.numeric(meta_fit$b),
+        digits = 2,
+        format = "f"
+      ),
+      " [",
+      formatC(
+        meta_fit$ci.lb,
+        digits = 2,
+        format = "f"
+      ),
+      ", ",
+      formatC(
+        meta_fit$ci.ub,
+        digits = 2,
+        format = "f"
+      ),
+      "]; ",
+      format_p(meta_fit$pval),
+      "; I2 = ",
+      formatC(
+        meta_fit$I2,
+        digits = 1,
+        format = "f"
+      ),
+      "%"
+    )
+  }
+
+  plot_object +
+    scale_y_continuous(
+      breaks = y_breaks,
+      labels = y_labels,
+      expand = expansion(
+        mult = c(0.03, 0.04)
+      )
+    ) +
+    labs(
+      title = metric_labels[[metric_name]],
+      subtitle = subtitle_text,
+      x = "Hedges' g (Invasive - Native)",
+      y = NULL
+    ) +
+    theme_publication +
+    theme(
+      panel.grid.major.y = element_blank()
+    )
+}
+
+alpha_forest_panels <- lapply(
+  metric_levels,
+  make_alpha_forest
+)
+
+names(alpha_forest_panels) <- metric_levels
+
+p_alpha_forest <- (
+  alpha_forest_panels[["Chao1"]] +
+    alpha_forest_panels[["Richness"]]
+) / (
+  alpha_forest_panels[["Shannon"]] +
+    alpha_forest_panels[["Simpson"]]
+) +
+  patchwork::plot_annotation(
+    title = paste0(
+      MARKER,
+      " study-level standardized alpha-diversity effects"
+    ),
+    tag_levels = "A"
+  )
+
+
+# ==============================================================================
+# 16. PLOTS: BETA DIVERSITY
+# ==============================================================================
+
+# 16.1 Corrected Delta Bray-Curtis forest and summary
+delta_forest_data <- beta_summary_all |>
+  filter(
+    is.finite(Delta_BrayCurtis),
+    is.finite(Delta_Bray_CI_low),
+    is.finite(Delta_Bray_CI_high)
+  ) |>
+  arrange(StudyNumber) |>
+  mutate(
+    y = rev(seq_len(n()))
+  )
+
+p_delta_bray_forest <- ggplot(
+  delta_forest_data
+) +
+  geom_vline(
+    xintercept = 0,
+    linetype = "dashed",
+    color = "red",
+    linewidth = 0.55
+  ) +
+  geom_segment(
+    aes(
+      x = Delta_Bray_CI_low,
+      xend = Delta_Bray_CI_high,
+      y = y,
+      yend = y
+    ),
+    linewidth = 0.55
+  ) +
+  geom_point(
+    aes(
+      x = Delta_BrayCurtis,
+      y = y
+    ),
+    size = 2.4
+  )
+
+delta_y_breaks <- delta_forest_data$y
+delta_y_labels <- delta_forest_data$Study
+delta_subtitle <- paste0(
+  nrow(delta_forest_data),
+  " studies with bootstrap 95% CIs"
+)
+
+if (!is.null(delta_bray_meta_fit)) {
+  pooled_delta <- tibble::tibble(
+    Estimate = as.numeric(
+      delta_bray_meta_fit$b
+    ),
+    CI_low = delta_bray_meta_fit$ci.lb,
+    CI_high = delta_bray_meta_fit$ci.ub,
+    y = 0
+  )
+
+  p_delta_bray_forest <- p_delta_bray_forest +
+    geom_segment(
+      data = pooled_delta,
+      aes(
+        x = CI_low,
+        xend = CI_high,
+        y = y,
+        yend = y
+      ),
+      inherit.aes = FALSE,
+      linewidth = 1.0
+    ) +
+    geom_point(
+      data = pooled_delta,
+      aes(
+        x = Estimate,
+        y = y
+      ),
+      inherit.aes = FALSE,
+      shape = 23,
+      size = 4.0,
+      fill = "white",
+      stroke = 0.9
+    )
+
+  delta_y_breaks <- c(
+    0,
+    delta_y_breaks
+  )
+
+  delta_y_labels <- c(
+    "Pooled",
+    delta_y_labels
+  )
+
+  delta_subtitle <- paste0(
+    "REML pooled Delta = ",
+    formatC(
+      as.numeric(delta_bray_meta_fit$b),
+      digits = 3,
+      format = "f"
+    ),
+    " [",
+    formatC(
+      delta_bray_meta_fit$ci.lb,
+      digits = 3,
+      format = "f"
+    ),
+    ", ",
+    formatC(
+      delta_bray_meta_fit$ci.ub,
+      digits = 3,
+      format = "f"
+    ),
+    "]; ",
+    format_p(delta_bray_meta_fit$pval),
+    "; I2 = ",
+    formatC(
+      delta_bray_meta_fit$I2,
+      digits = 1,
+      format = "f"
+    ),
+    "%"
+  )
+}
+
+p_delta_bray_forest <- p_delta_bray_forest +
+  scale_y_continuous(
+    breaks = delta_y_breaks,
+    labels = delta_y_labels,
+    expand = expansion(
+      mult = c(0.03, 0.04)
+    )
+  ) +
+  labs(
+    title = "Corrected study-level Delta Bray-Curtis",
+    subtitle = delta_subtitle,
+    x = expression(Delta~"Bray-Curtis"),
+    y = NULL
+  ) +
+  theme_publication +
+  theme(
+    panel.grid.major.y = element_blank()
+  )
+
+delta_summary_data <- beta_summary_all |>
+  filter(
+    is.finite(Delta_BrayCurtis)
+  )
+
+delta_max <- max(
+  delta_summary_data$Delta_BrayCurtis,
+  na.rm = TRUE
+)
+
+delta_min <- min(
+  delta_summary_data$Delta_BrayCurtis,
+  na.rm = TRUE
+)
+
+delta_range <- max(
+  delta_max - delta_min,
+  0.05
+)
+
+p_delta_bray_summary <- ggplot(
+  delta_summary_data,
+  aes(
+    x = MARKER,
+    y = Delta_BrayCurtis
+  )
+) +
+  geom_hline(
+    yintercept = 0,
+    linetype = "dashed",
+    color = "red",
+    linewidth = 0.55
+  ) +
+  geom_boxplot(
+    width = 0.42,
+    outlier.shape = NA,
+    fill = "white",
+    color = "black",
+    linewidth = 0.75
+  ) +
+  geom_jitter(
+    width = 0.08,
+    size = 2.3,
+    alpha = 0.85
+  ) +
+  annotate(
+    "text",
+    x = 1,
+    y = delta_max + 0.13 * delta_range,
+    label = delta_bray_overall$Significance,
+    color = ifelse(
+      delta_bray_overall$Significance == "ns",
+      "blue",
+      "red"
+    ),
+    fontface = "bold",
+    size = 5
+  ) +
+  labs(
+    title = "Beta-diversity shift",
+    subtitle = format_p(
+      delta_bray_overall$P
+    ),
+    x = NULL,
+    y = expression(Delta~"Bray-Curtis")
+  ) +
+  scale_y_continuous(
+    expand = expansion(
+      mult = c(0.08, 0.22)
+    )
+  ) +
+  theme_publication +
+  theme(
+    axis.text.x = element_text(
+      face = "bold"
+    )
+  )
+
+p_delta_bray <- (
+  p_delta_bray_forest |
+    p_delta_bray_summary
+) +
+  patchwork::plot_layout(
+    widths = c(2.1, 0.9)
+  ) +
+  patchwork::plot_annotation(
+    tag_levels = "A"
+  )
+
+# 16.2 Study-level PERMANOVA R2
+permanova_plot_data <- beta_summary_all |>
+  filter(
+    is.finite(PERMANOVA_R2)
+  ) |>
+  mutate(
+    Study = factor(
+      Study,
+      levels = Study[
+        order(StudyNumber)
+      ]
+    ),
+    Significance = case_when(
+      PERMANOVA_P_BH < 0.05 ~
+        "BH-adjusted P < 0.05",
+      TRUE ~
+        "BH-adjusted P >= 0.05"
+    )
+  )
+
+p_permanova <- ggplot(
+  permanova_plot_data,
+  aes(
+    x = Study,
+    y = PERMANOVA_R2,
+    fill = Significance
+  )
+) +
+  geom_col(
+    width = 0.72,
+    color = "black",
+    linewidth = 0.3
+  ) +
+  scale_fill_manual(
+    values = c(
+      "BH-adjusted P < 0.05" =
+        "#D95F5F",
+      "BH-adjusted P >= 0.05" =
+        "grey72"
+    )
+  ) +
+  labs(
+    title = "PlantGroup-level PERMANOVA",
+    subtitle = "Status effect within each study",
+    x = "Study",
+    y = expression(PERMANOVA~R^2),
+    fill = NULL
+  ) +
+  theme_publication +
+  theme(
+    axis.text.x = element_text(
+      angle = 45,
+      hjust = 1
+    ),
+    legend.position = "top"
+  )
+
+# 16.3 Beta dispersion
+dispersion_plot_data <- dispersion_study |>
+  select(
+    Study,
+    Dispersion_Native,
+    Dispersion_Invasive
+  ) |>
+  pivot_longer(
+    cols = starts_with("Dispersion_"),
+    names_to = "Status",
+    values_to = "MeanDispersion"
+  ) |>
+  mutate(
+    Status = stringr::str_remove(
+      Status,
+      "^Dispersion_"
+    ),
+    Status = factor(
+      Status,
+      levels = c("Native", "Invasive")
+    )
+  )
+
+dispersion_max <- max(
+  dispersion_plot_data$MeanDispersion,
+  na.rm = TRUE
+)
+
+dispersion_min <- min(
+  dispersion_plot_data$MeanDispersion,
+  na.rm = TRUE
+)
+
+dispersion_range <- max(
+  dispersion_max - dispersion_min,
+  0.05
+)
+
+p_dispersion <- ggplot(
+  dispersion_plot_data,
+  aes(
+    x = Status,
+    y = MeanDispersion,
+    fill = Status
+  )
+) +
+  geom_boxplot(
+    width = 0.52,
+    outlier.shape = NA,
+    color = "black",
+    linewidth = 0.75
+  ) +
+  geom_line(
+    aes(group = Study),
+    color = "grey55",
+    linewidth = 0.45,
+    alpha = 0.70
+  ) +
+  geom_point(
+    aes(color = Status),
+    size = 2.7,
+    alpha = 0.90
+  ) +
+  annotate(
+    "text",
+    x = 1.5,
+    y = dispersion_max +
+      0.17 * dispersion_range,
+    label = dispersion_overall$Significance,
+    color = ifelse(
+      dispersion_overall$Significance == "ns",
+      "blue",
+      "red"
+    ),
+    fontface = "bold",
+    size = 5
+  ) +
+  scale_fill_manual(
+    values = STATUS_COLORS
+  ) +
+  scale_color_manual(
+    values = STATUS_COLORS
+  ) +
+  labs(
+    title = "Beta dispersion",
+    subtitle = format_p(
+      dispersion_overall$P
+    ),
+    x = NULL,
+    y = "Mean distance to status centroid"
+  ) +
+  scale_y_continuous(
+    expand = expansion(
+      mult = c(0.04, 0.22)
+    )
+  ) +
+  theme_publication +
+  theme(
+    legend.position = "none",
+    axis.text.x = element_text(
+      face = "bold"
+    )
+  )
+
+# 16.4 Study-specific PCoA
+study_levels <- pcoa_all |>
+  distinct(Study) |>
+  mutate(
+    StudyNumber =
+      study_number(Study)
+  ) |>
+  arrange(StudyNumber) |>
+  pull(Study)
+
+p_pcoa <- pcoa_all |>
+  mutate(
+    Study = factor(
+      Study,
+      levels = study_levels
+    ),
+    Status = factor(
+      Status,
+      levels = c("Native", "Invasive")
+    )
+  ) |>
+  ggplot(
+    aes(
+      x = PCoA1,
+      y = PCoA2,
+      color = Status
+    )
+  ) +
+  geom_point(
+    size = 2.1,
+    alpha = 0.85
+  ) +
+  facet_wrap(
+    ~ Study,
+    scales = "free"
+  ) +
+  scale_color_manual(
+    values = STATUS_COLORS
+  ) +
+  labs(
+    title = "Study-specific PlantGroup-level PCoA",
+    subtitle = "Ordination axes are study-specific",
+    x = "PCoA1",
+    y = "PCoA2",
+    color = NULL
+  ) +
+  theme_publication +
+  theme(
+    legend.position = "top"
+  )
+
+# 16.5 Global partial dbRDA
+p_global_dbrda <- NULL
+
+if (nrow(global_dbrda_scores) > 0) {
+  p_global_dbrda <- ggplot(
+    global_dbrda_scores,
+    aes(
+      x = Axis1,
+      y = Axis2,
+      color = Status
+    )
+  ) +
+    geom_point(
+      size = 2.4,
+      alpha = 0.80
+    ) +
+    stat_ellipse(
+      aes(group = Status),
+      type = "t",
+      linetype = "dashed",
+      linewidth = 0.7,
+      show.legend = FALSE
+    ) +
+    scale_color_manual(
+      values = STATUS_COLORS
+    ) +
+    labs(
+      title = "Partial dbRDA of PlantGroup centroids",
+      subtitle = paste0(
+        "Status | Study: adjusted R2 = ",
+        formatC(
+          global_dbrda_summary$Adjusted_R2,
+          digits = 3,
+          format = "f"
+        ),
+        "; ",
+        format_p(
+          global_dbrda_summary$Status_P
+        )
+      ),
+      x = "Constrained axis 1",
+      y = "Axis 2",
+      color = NULL
+    ) +
+    theme_publication +
+    theme(
+      legend.position = "top"
+    )
+}
+
+
+# ==============================================================================
+# 17. SAVE FIGURES
+# ==============================================================================
+
+save_plot_set <- function(
+  plot_object,
+  file_stem,
+  width,
+  height
+) {
+  ggplot2::ggsave(
+    filename = file.path(
+      FIGURE_DIR,
+      paste0(file_stem, ".pdf")
+    ),
+    plot = plot_object,
+    width = width,
+    height = height,
+    units = "in"
+  )
+
+  ggplot2::ggsave(
+    filename = file.path(
+      FIGURE_DIR,
+      paste0(file_stem, ".tiff")
+    ),
+    plot = plot_object,
+    width = width,
+    height = height,
+    units = "in",
+    dpi = 600,
+    compression = "lzw"
+  )
+
+  ggplot2::ggsave(
+    filename = file.path(
+      FIGURE_DIR,
+      paste0(file_stem, ".png")
+    ),
+    plot = plot_object,
+    width = width,
+    height = height,
+    units = "in",
+    dpi = 400
+  )
+}
+
+save_plot_set(
+  p_alpha_raw,
+  paste0(MARKER, "_alpha_raw"),
+  14,
+  5.5
+)
+
+save_plot_set(
+  p_alpha_standardized,
+  paste0(MARKER, "_alpha_standardized"),
+  14,
+  5.6
+)
+
+save_plot_set(
+  p_alpha_delta,
+  paste0(MARKER, "_alpha_raw_delta"),
+  10.5,
+  9
+)
+
+save_plot_set(
+  p_alpha_forest,
+  paste0(MARKER, "_alpha_Hedges_g_forest"),
+  14,
+  10
+)
+
+save_plot_set(
+  p_delta_bray,
+  paste0(MARKER, "_corrected_Delta_BrayCurtis"),
+  13,
+  7.5
+)
+
+save_plot_set(
+  p_permanova,
+  paste0(MARKER, "_PERMANOVA_R2"),
+  10.5,
+  5.5
+)
+
+save_plot_set(
+  p_dispersion,
+  paste0(MARKER, "_beta_dispersion"),
+  6.2,
+  5.3
+)
+
+save_plot_set(
+  p_pcoa,
+  paste0(MARKER, "_study_specific_PCoA"),
+  14,
+  10
+)
+
+if (!is.null(p_global_dbrda)) {
+  save_plot_set(
+    p_global_dbrda,
+    paste0(MARKER, "_global_partial_dbRDA"),
+    7.4,
+    6
+  )
+}
+
+
+# ==============================================================================
+# 18. EXPORT TABLES
+# ==============================================================================
+
+readme_table <- tibble::tibble(
+  Analysis = c(
+    "Raw alpha diversity",
+    "Standardized alpha diversity",
+    "Study-level raw alpha difference",
+    "Study-level Hedges' g",
+    "Corrected Delta Bray-Curtis",
+    "Study-level PERMANOVA",
+    "Beta dispersion",
+    "Study-specific PCoA",
+    "Global partial dbRDA"
+  ),
+  Independent_unit = c(
+    "PlantGroup mean; samples displayed transparently",
+    "PlantGroup mean z score; samples displayed transparently",
+    "One PlantGroup-weighted difference per study",
+    "PlantGroup means within each study",
+    "PlantGroup centroid; one Delta per study",
+    "PlantGroup centroid within study",
+    "PlantGroup centroid; paired study means",
+    "PlantGroup centroid within study",
+    "PlantGroup centroid across studies"
+  ),
+  Statistical_method = c(
+    "Mixed-effects inference on within-study z scores",
+    "Alpha_z ~ Status + (1|Study) + (1|PlantGroup)",
+    "One-sample Wilcoxon test against zero; BH adjustment",
+    "REML random-effects meta-analysis",
+    "Bootstrap CI; permutation test; Wilcoxon and REML synthesis",
+    "adonis2 with 999 permutations; BH adjustment",
+    "betadisper with bias adjustment; paired Wilcoxon across studies",
+    "Bray-Curtis PCoA",
+    "dbrda: community ~ Status + Condition(Study)"
+  )
+)
+
+output_tables <- list(
+  README = readme_table,
+  Study_file_pairs = study_pairs,
+  Metadata_diagnostic = metadata_all,
+  Library_depth = depth_all,
+
+  Alpha_sample = alpha_sample_all,
+  Alpha_PlantGroup = alpha_group_all,
+  Alpha_sample_z = alpha_sample_z,
+  Alpha_PlantGroup_z = alpha_group_z,
+  Alpha_mixed_models = alpha_model_results,
+  Alpha_status_means = status_mean_alpha,
+  Alpha_study_Delta = study_delta_alpha,
+  Alpha_Delta_tests = alpha_delta_tests,
+  Alpha_study_effects = alpha_effects_all,
+  Alpha_meta_summary = alpha_meta_summary,
+
+  Beta_study_summary = beta_summary_all,
+  Beta_Delta_overall = delta_bray_overall,
+  Beta_Delta_meta = delta_bray_meta_summary,
+  Beta_Delta_bootstrap = bootstrap_delta_all,
+  Beta_dispersion_values = dispersion_values_all,
+  Beta_dispersion_overall = dispersion_overall,
+  PCoA_coordinates = pcoa_all,
+  Global_dbRDA_summary = global_dbrda_summary,
+  Global_dbRDA_scores = global_dbrda_scores,
+
+  Run_log = run_log
+)
+
+result_workbook <- openxlsx::createWorkbook()
+
+for (sheet_name in names(output_tables)) {
+  openxlsx::addWorksheet(
+    result_workbook,
+    sheet_name
+  )
+
+  openxlsx::writeData(
+    result_workbook,
+    sheet_name,
+    output_tables[[sheet_name]]
+  )
+
+  openxlsx::freezePane(
+    result_workbook,
+    sheet_name,
+    firstRow = TRUE
+  )
+
+  openxlsx::setColWidths(
+    result_workbook,
+    sheet_name,
+    cols = seq_len(
+      max(
+        1,
+        ncol(output_tables[[sheet_name]])
+      )
+    ),
+    widths = "auto"
+  )
+}
+
+openxlsx::saveWorkbook(
+  result_workbook,
+  file.path(
+    TABLE_DIR,
+    paste0(
+      MARKER,
+      "_alpha_beta_analysis_results.xlsx"
+    )
+  ),
+  overwrite = TRUE
+)
+
+write.csv(
+  beta_summary_all,
+  file.path(
+    TABLE_DIR,
+    paste0(
+      MARKER,
+      "_beta_study_summary.csv"
+    )
+  ),
+  row.names = FALSE,
+  fileEncoding = "UTF-8"
+)
+
+write.csv(
+  alpha_model_results,
+  file.path(
+    TABLE_DIR,
+    paste0(
+      MARKER,
+      "_alpha_mixed_model_results.csv"
+    )
+  ),
+  row.names = FALSE,
+  fileEncoding = "UTF-8"
+)
+
+
+# ==============================================================================
+# 19. SESSION INFORMATION
+# ==============================================================================
+
+session_info_file <- file.path(
+  OUTPUT_DIR,
+  "sessionInfo.txt"
+)
+
+sink(session_info_file)
+print(sessionInfo())
+sink()
+
+
+# ==============================================================================
+# 20. COMPLETION MESSAGE
+# ==============================================================================
+
+cat("\n")
+cat("============================================================\n")
+cat("Cross-study alpha and beta analysis completed.\n")
+cat("Marker: ", MARKER, "\n", sep = "")
+cat("Input directory: ", INPUT_DIR, "\n", sep = "")
+cat("Output directory: ", OUTPUT_DIR, "\n", sep = "")
+cat("\n")
+cat("Required checks before interpretation:\n")
+cat("1. Inspect Metadata_diagnostic for PlantGroup assignments.\n")
+cat("2. Inspect Library_depth for sequencing-depth comparability.\n")
+cat("3. Inspect Run_log for failed studies.\n")
+cat("4. Use global partial dbRDA only if feature IDs are comparable.\n")
+cat("============================================================\n")
